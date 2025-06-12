@@ -1,4 +1,3 @@
-Report, comment edit and delete
 
 #!/usr/bin/env python
 # coding: utf-8
