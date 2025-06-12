@@ -1,3 +1,5 @@
+Report, comment edit and delete
+
 #!/usr/bin/env python
 # coding: utf-8
 
@@ -165,6 +167,27 @@ if not SCRAPER_API_KEY:
 # ==============================================================================
 # --- 4. Database Models ---
 # ==============================================================================
+
+# In Rev14.py, add this new model
+
+class ReportedArticle(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    # Foreign key to the community article that was reported
+    article_id = db.Column(db.Integer, db.ForeignKey('community_article.id', ondelete="CASCADE"), nullable=False)
+    # Foreign key to the user who filed the report
+    reporter_user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete="CASCADE"), nullable=False)
+    # The reason for the report (optional but recommended)
+    reason = db.Column(db.String(250), nullable=True)
+    # The status of the report
+    status = db.Column(db.String(20), nullable=False, default='pending') # e.g., 'pending', 'resolved'
+    timestamp = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    # Ensures a user can only report a specific article once
+    __table_args__ = (db.UniqueConstraint('article_id', 'reporter_user_id', name='_article_reporter_uc'),)
+
+    # Add a relationship back to CommunityArticle model
+    article = db.relationship('CommunityArticle', backref=db.backref('reports', lazy='dynamic'))
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -855,6 +878,46 @@ def get_sort_key(article):
 
 # In Rev14.py, find your existing index function and REPLACE IT with this entire block.
 
+# In Rev14.py, add this new route
+
+@app.route('/report_article/<article_hash_id>', methods=['POST'])
+@login_required
+def report_article(article_hash_id):
+    # This feature is only for community articles
+    article = CommunityArticle.query.filter_by(article_hash_id=article_hash_id).first_or_404()
+
+    # Check if the user has already reported this article
+    existing_report = ReportedArticle.query.filter_by(
+        article_id=article.id, 
+        reporter_user_id=session['user_id']
+    ).first()
+
+    if existing_report:
+        return jsonify({
+            "success": False, 
+            "error": "You have already reported this article."
+        }), 409 # 409 Conflict
+
+    # Create a new report record
+    new_report = ReportedArticle(
+        article_id=article.id,
+        reporter_user_id=session['user_id']
+        # You could expand this to include a reason from the request body
+    )
+    
+    try:
+        db.session.add(new_report)
+        db.session.commit()
+        app.logger.info(f"User {session['user_id']} reported article {article.id} ({article_hash_id})")
+        return jsonify({
+            "success": True, 
+            "message": "Article has been reported for review. Thank you."
+        })
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error reporting article {article.id}: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "A database error occurred."}), 500
+
 @app.route('/')
 @app.route('/page/<int:page>')
 @app.route('/category/<category_name>')
@@ -960,6 +1023,11 @@ def public_profile(username):
 @app.route('/search')
 @app.route('/search/page/<int:page>')
 def search_results(page=1):
+    # --- STEP 1: VERIFICATION ---
+    # This message will appear on your webpage if this function is running correctly.
+    # If you don't see it, your server has not reloaded the new code.
+    flash("DEBUG: The correct search_results function was called!", "success")
+
     session['previous_list_page'] = request.full_path
     query_str = request.args.get('query', '').strip()
     per_page = app.config['PER_PAGE']
@@ -967,29 +1035,43 @@ def search_results(page=1):
     if not query_str:
         return redirect(url_for('index'))
 
+    # This log will appear in your server console (terminal).
     app.logger.info(f"Performing LIVE API search for query: '{query_str}'")
     
-    # --- NEW: Live Search Logic ---
+    # This list will hold the fresh results from our new API call.
     api_articles = []
     if newsapi:
         try:
-            # Perform a live search against the NewsAPI for the user's query
+            # --- STEP 2: LIVE API CALL ---
+            # We are making a new, targeted request to the NewsAPI here.
+            
+            # Log the exact parameters to be sent to the API for debugging.
+            app.logger.info(f"NEWSAPI CALL PARAMS: q='{query_str}', language='en', sort_by='relevancy'")
+
             search_response = newsapi.get_everything(
-                q=query_str,
+                q=query_str,          # Use the user's keyword for the query.
                 language='en',
-                sort_by='relevancy', # Sort by the most relevant articles for the query
-                page_size=100 # Get a full set of results for pagination
+                sort_by='relevancy',  # Get the most relevant articles first.
+                page_size=100         # Fetch a good number of articles for pagination.
             )
 
+            # Log the raw response from the API to see exactly what it returned.
+            app.logger.info(f"RAW API RESPONSE (first 500 chars): {str(search_response)[:500]}")
+
+            # --- STEP 3: PROCESS THE RELEVANT RESULTS ---
+            # The following code processes the fresh articles returned by the API.
             if search_response.get('status') == 'ok':
-                # Process the results just like our other fetch functions
                 raw_articles = search_response.get('articles', [])
                 unique_urls = set()
                 for art_data in raw_articles:
                     url = art_data.get('url')
-                    if not url or url in unique_urls: continue
+                    if not url or url in unique_urls: 
+                        continue
+                        
                     title = art_data.get('title')
                     description = art_data.get('description')
+
+                    # Skip articles that are malformed or removed.
                     if not all([title, description, art_data.get('source')]) or title == '[Removed]':
                         continue
                     
@@ -997,46 +1079,59 @@ def search_results(page=1):
                     article_id = generate_article_id(url)
                     source_name = art_data['source'].get('name', 'Unknown Source')
                     placeholder_text = urllib.parse.quote_plus(source_name[:20])
+                    
                     published_at_dt = None
                     if art_data.get('publishedAt'):
-                        try: published_at_dt = datetime.fromisoformat(art_data.get('publishedAt').replace('Z', '+00:00'))
-                        except ValueError: published_at_dt = datetime.now(timezone.utc)
+                        try:
+                            published_at_dt = datetime.fromisoformat(art_data.get('publishedAt').replace('Z', '+00:00'))
+                        except ValueError:
+                            published_at_dt = datetime.now(timezone.utc)
                     else:
                         published_at_dt = datetime.now(timezone.utc)
                     
                     standardized_article = {
-                        'id': article_id, 'title': title, 'description': description, 'url': url,
+                        'id': article_id,
+                        'title': title,
+                        'description': description,
+                        'url': url,
                         'urlToImage': art_data.get('urlToImage') or f'https://via.placeholder.com/400x220/0D2C54/FFFFFF?text={placeholder_text}',
-                        'publishedAt': published_at_dt.isoformat(), 'source': {'name': source_name},
+                        'publishedAt': published_at_dt.isoformat(),
+                        'source': {'name': source_name},
                         'is_community_article': False
                     }
-                    MASTER_ARTICLE_STORE[article_id] = standardized_article # Add to cache
+                    # Add to the master store so the article detail page can find it.
+                    MASTER_ARTICLE_STORE[article_id] = standardized_article 
                     api_articles.append(standardized_article)
             else:
-                app.logger.error(f"NewsAPI error on search: {search_response.get('message')}")
-                flash(f"Could not perform search at this time. Error: {search_response.get('message')}", "danger")
+                # Handle cases where the API returns an error.
+                api_error_message = search_response.get('message', 'Unknown API error')
+                app.logger.error(f"NewsAPI error on search: {api_error_message}")
+                flash(f"Could not perform search at this time. Error: {api_error_message}", "danger")
 
         except Exception as e:
             app.logger.error(f"Exception during API search for '{query_str}': {e}", exc_info=True)
             flash("An unexpected error occurred during the search.", "danger")
     
-    # Also search our own community-posted articles
+    # --- STEP 4: COMBINE WITH LOCAL RESULTS ---
+    # Also search your app's own community-posted articles for the same keyword.
     community_db_articles = []
     community_db_articles_query = CommunityArticle.query.options(joinedload(CommunityArticle.author)).filter(
         db.or_(CommunityArticle.title.ilike(f'%{query_str}%'), CommunityArticle.description.ilike(f'%{query_str}%'))
     ).order_by(CommunityArticle.published_at.desc())
+    
     for art in community_db_articles_query.all():
         art.is_community_article = True
         community_db_articles.append(art)
 
-    # Combine and sort results
+    # --- STEP 5: FINALIZE AND RENDER ---
+    # Combine API results and community results, then sort them by date.
     all_search_results_raw = api_articles + community_db_articles
     all_search_results_raw.sort(key=get_sort_key, reverse=True)
 
-    # Paginate the combined results
+    # Paginate the final combined list.
     paginated_search_articles_raw, total_pages = get_paginated_articles(all_search_results_raw, page, per_page)
 
-    # Add bookmark status to the paginated results
+    # Add user-specific data like bookmark status before rendering.
     paginated_search_articles_with_bookmark_status = []
     user_bookmarks_hashes = set()
     if 'user_id' in session:
@@ -1052,6 +1147,7 @@ def search_results(page=1):
             art_item_copy['is_bookmarked'] = art_item_copy.get('id') in user_bookmarks_hashes
             paginated_search_articles_with_bookmark_status.append(art_item_copy)
             
+    # Render the results page.
     return render_template("INDEX_HTML_TEMPLATE",
                            articles=paginated_search_articles_with_bookmark_status,
                            selected_category=f"Search: {query_str}",
@@ -1061,6 +1157,7 @@ def search_results(page=1):
                            featured_article_on_this_page=False,
                            query=query_str,
                            current_filter_date=None)
+
 
 @app.route('/article/<article_hash_id>')
 def article_detail(article_hash_id):
@@ -1237,6 +1334,54 @@ def vote_comment(comment_id):
         "reactions": reactions, 
         "user_reaction": user_reaction_after_vote
     }), 200
+
+# In Rev14.py, add these two new functions
+
+@app.route('/delete_comment/<int:comment_id>', methods=['POST'])
+@login_required
+def delete_comment(comment_id):
+    comment = Comment.query.get_or_404(comment_id)
+
+    # Security Check: Ensure the logged-in user is the owner of the comment.
+    if comment.user_id != session['user_id']:
+        return jsonify({"success": False, "error": "You are not authorized to delete this comment."}), 403
+
+    try:
+        # Thanks to `cascade="all, delete-orphan"` in our Comment model's 'replies' relationship,
+        # deleting the parent comment will automatically delete all its replies from the database.
+        db.session.delete(comment)
+        db.session.commit()
+        app.logger.info(f"User {session['user_id']} deleted comment {comment_id} and its replies.")
+        return jsonify({"success": True})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error deleting comment {comment_id}: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "A database error occurred."}), 500
+
+
+@app.route('/edit_comment/<int:comment_id>', methods=['POST'])
+@login_required
+def edit_comment(comment_id):
+    comment = Comment.query.get_or_404(comment_id)
+    
+    # Security Check: Ensure the logged-in user is the owner of the comment.
+    if comment.user_id != session['user_id']:
+        return jsonify({"success": False, "error": "You are not authorized to edit this comment."}), 403
+
+    new_content = request.json.get('content', '').strip()
+    if not new_content:
+        return jsonify({"success": False, "error": "Comment content cannot be empty."}), 400
+
+    try:
+        comment.content = new_content
+        db.session.commit()
+        app.logger.info(f"User {session['user_id']} edited comment {comment_id}.")
+        # Return the new content so the frontend can display it instantly.
+        return jsonify({"success": True, "new_content": comment.content})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error editing comment {comment_id}: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "A database error occurred."}), 500
 
 @app.route('/post_article', methods=['POST'])
 @login_required
@@ -2319,6 +2464,7 @@ ARTICLE_HTML_TEMPLATE = """
     .loader { border: 5px solid var(--light-bg); border-top: 5px solid var(--primary-color); border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin-bottom: 1rem; }
     .content-text { white-space: pre-wrap; line-height: 1.8; font-size: 1.05rem; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .edit-form-container { display: none; } /* Hide edit form by default */
 </style>
 {% endblock %}
 {% block content %}
@@ -2328,10 +2474,24 @@ ARTICLE_HTML_TEMPLATE = """
 <article class="article-full-content-wrapper animate-fade-in">
     <div class="mb-3 d-flex justify-content-between align-items-center">
         <a href="{{ previous_list_page }}" class="btn btn-sm btn-outline-secondary"><i class="fas fa-arrow-left me-2"></i>Back to List</a>
-        {% if session.user_id %}
-        <button id="bookmarkBtn" class="bookmark-btn {% if is_bookmarked %}active{% endif %}" title="{% if is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}" data-article-hash-id="{{ article.article_hash_id if is_community_article else article.id }}" data-is-community="{{ 'true' if is_community_article else 'false' }}" data-title="{{ article.title|e }}" data-source-name="{{ (article.author.name if is_community_article and article.author else article.source.name)|e }}" data-image-url="{{ (article.image_url if is_community_article else article.urlToImage)|e }}" data-description="{{ (article.description if article.description else '')|e }}" data-published-at="{{ (article.published_at.isoformat() if is_community_article and article.published_at else (article.publishedAt if not is_community_article and article.publishedAt else ''))|e }}"><i class="fa-solid fa-bookmark"></i></button>
-        {% endif %}
+        
+        <!-- Wrapper for right-side action buttons -->
+        <div class="d-flex align-items-center gap-2">
+            {% if session.user_id %}
+                
+                <!-- NEW: Report Button for Community Articles -->
+                {% if is_community_article %}
+                <button id="reportBtn" class="btn btn-sm btn-outline-warning" title="Report this article for review">
+                    <i class="fas fa-flag"></i> Report
+                </button>
+                {% endif %}
+                
+                <!-- Existing Bookmark Button -->
+                <button id="bookmarkBtn" class="bookmark-btn {% if is_bookmarked %}active{% endif %}" title="{% if is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}" data-article-hash-id="{{ article.article_hash_id if is_community_article else article.id }}" data-is-community="{{ 'true' if is_community_article else 'false' }}" data-title="{{ article.title|e }}" data-source-name="{{ (article.author.name if is_community_article and article.author else article.source.name)|e }}" data-image-url="{{ (article.image_url if is_community_article else article.urlToImage)|e }}" data-description="{{ (article.description if article.description else '')|e }}" data-published-at="{{ (article.published_at.isoformat() if is_community_article and article.published_at else (article.publishedAt if not is_community_article and article.publishedAt else ''))|e }}"><i class="fa-solid fa-bookmark"></i></button>
+            {% endif %}
+        </div>
     </div>
+
     <h1 class="mb-2 article-title-main display-6">{{ article.title }}</h1>
     <div class="article-meta-detailed d-flex align-items-center flex-wrap gap-3 text-muted small"><span class="meta-item" title="Source"><i class="fas fa-{{ 'user-edit' if is_community_article else 'building' }}"></i> {{ article.author.name if is_community_article and article.author else article.source.name }}</span><span class="meta-item" title="Published Date"><i class="far fa-calendar-alt"></i> {{ (article.published_at | to_ist if is_community_article else (article.publishedAt | to_ist if article.publishedAt else 'N/A')) }}</span></div>
     {% set image_to_display = article.image_url if is_community_article else article.urlToImage %}
@@ -2424,7 +2584,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 })
                 .then(res => {
                     if (res.status === 401) { throw new Error("Your session has expired. Please refresh the page and log in again."); }
-                    if (!res.ok) { throw new Error("An unknown server error occurred while posting."); }
+                    if (!res.ok) { return res.json().then(err => { throw new Error(err.error || "An unknown server error occurred."); }); }
                     return res.json();
                 })
                 .then(data => {
@@ -2461,14 +2621,66 @@ document.addEventListener('DOMContentLoaded', function () {
                 summaryContainer.innerHTML = summaryHTML;
             };
 
-            // Main event listener for all actions in the comment section
             commentSection.addEventListener('click', function(e) {
                 const target = e.target;
-                const replyBtn = target.closest('.reply-btn');
-                const cancelBtn = target.closest('.cancel-reply-btn');
-                const reactBtn = target.closest('.react-btn');
-                const reactionEmoji = target.closest('.reaction-emoji');
+                
+                const deleteBtn = target.closest('.delete-btn');
+                if (deleteBtn) {
+                    e.preventDefault();
+                    const commentId = deleteBtn.dataset.commentId;
+                    if (confirm('Are you sure you want to delete this comment? All replies will also be removed.')) {
+                        fetch(`/delete_comment/${commentId}`, { method: 'POST' })
+                            .then(res => {
+                                if (!res.ok) { return res.json().then(err => { throw new Error(err.error) }); }
+                                return res.json();
+                            })
+                            .then(data => {
+                                if (data.success) {
+                                    const commentElement = document.getElementById(`comment-${commentId}`);
+                                    const repliesCount = commentElement.querySelectorAll('.comment-thread').length;
+                                    const totalCommentsToRemove = 1 + repliesCount;
+                                    
+                                    const countEl = document.getElementById('comment-count');
+                                    countEl.textContent = Math.max(0, parseInt(countEl.textContent) - totalCommentsToRemove);
+                                    
+                                    commentElement.style.transition = 'opacity 0.5s ease';
+                                    commentElement.style.opacity = '0';
+                                    setTimeout(() => commentElement.remove(), 500);
+                                } else {
+                                    alert('Error: ' + data.error);
+                                }
+                            })
+                            .catch(err => {
+                                console.error("Delete error:", err);
+                                alert("Could not delete comment: " + err.message);
+                            });
+                    }
+                    return;
+                }
 
+                const editBtn = target.closest('.edit-btn');
+                if (editBtn) {
+                    e.preventDefault();
+                    const commentId = editBtn.dataset.commentId;
+                    const commentThread = document.getElementById(`comment-${commentId}`);
+                    const commentBody = commentThread.querySelector('.comment-body');
+                    commentBody.querySelector('.comment-content').style.display = 'none';
+                    commentBody.querySelector('.comment-actions').style.display = 'none';
+                    commentBody.querySelector('.edit-form-container').style.display = 'block';
+                    return;
+                }
+
+                const cancelEditBtn = target.closest('.cancel-edit-btn');
+                if (cancelEditBtn) {
+                    e.preventDefault();
+                    const commentBody = cancelEditBtn.closest('.comment-body');
+                    commentBody.querySelector('.comment-content').style.display = 'block';
+                    commentBody.querySelector('.comment-actions').style.display = 'flex';
+                    commentBody.querySelector('.edit-form-container').style.display = 'none';
+                    return;
+                }
+
+                const replyBtn = target.closest('.reply-btn');
                 if (replyBtn) {
                     e.preventDefault();
                     const commentId = replyBtn.dataset.commentId;
@@ -2481,13 +2693,8 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     return;
                 }
-
-                if (cancelBtn) {
-                    e.preventDefault();
-                    cancelBtn.closest('.reply-form-container').style.display = 'none';
-                    return;
-                }
                 
+                const reactBtn = target.closest('.react-btn');
                 if (reactBtn) {
                     e.preventDefault();
                     const commentId = reactBtn.dataset.commentId;
@@ -2499,50 +2706,121 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     return;
                 }
-                
+
+                const reactionEmoji = target.closest('.reaction-emoji');
                 if (reactionEmoji) {
                     e.preventDefault();
                     const commentId = reactionEmoji.dataset.commentId;
                     const emoji = reactionEmoji.dataset.emoji;
                     reactionEmoji.closest('.reaction-box').classList.remove('show');
-                    fetch(`{{ url_for('vote_comment', comment_id=0) }}`.replace('0', commentId), {
+                    fetch(`/vote_comment/${commentId}`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
                         body: JSON.stringify({ emoji: emoji })
                     })
                     .then(res => res.json())
                     .then(data => {
-                        if (data.success) { updateReactionUI(commentId, data.reactions, data.user_reaction); }
+                        if (data.success) { updateReactionUI(commentId, data.reactions, data.user_reaction); } 
                         else { throw new Error(data.error || "Failed to vote."); }
                     })
                     .catch(err => { console.error("Reaction error:", err); alert("Error: " + err.message); });
                     return;
                 }
-
+                
                 if (!target.closest('.reaction-box') && !target.closest('.react-btn')) {
                     document.querySelectorAll('.reaction-box.show').forEach(box => box.classList.remove('show'));
                 }
             });
 
-            const mainCommentForm = document.getElementById('comment-form');
-            if(mainCommentForm) { mainCommentForm.addEventListener('submit', function(e) { e.preventDefault(); handleCommentSubmit(this); }); }
-            commentSection.addEventListener('submit', function(e) { if(e.target.matches('.reply-form')) { e.preventDefault(); handleCommentSubmit(e.target); } });
+            commentSection.addEventListener('submit', function(e) {
+                e.preventDefault();
+
+                if (e.target.matches('.edit-comment-form')) {
+                    const form = e.target;
+                    const commentId = form.closest('.comment-thread').id.replace('comment-', '');
+                    const newContent = form.querySelector('textarea[name="content"]').value.trim();
+                    if (!newContent) return;
+
+                    fetch(`/edit_comment/${commentId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content: newContent })
+                    })
+                    .then(res => {
+                        if (!res.ok) { return res.json().then(err => { throw new Error(err.error) }); }
+                        return res.json();
+                    })
+                    .then(data => {
+                        if (data.success) {
+                            const commentBody = form.closest('.comment-body');
+                            const contentP = commentBody.querySelector('.comment-content');
+                            contentP.textContent = data.new_content;
+                            contentP.style.display = 'block';
+                            commentBody.querySelector('.comment-actions').style.display = 'flex';
+                            form.closest('.edit-form-container').style.display = 'none';
+                        } else {
+                            alert('Error: ' + data.error);
+                        }
+                    })
+                    .catch(err => {
+                        console.error("Edit error:", err);
+                        alert("Could not save changes: " + err.message);
+                    });
+                    return;
+                }
+                
+                if (e.target.id === 'comment-form' || e.target.matches('.reply-form')) {
+                    handleCommentSubmit(e.target);
+                }
+            });
+        }
+
+        const reportBtn = document.getElementById('reportBtn');
+        if (reportBtn) {
+            reportBtn.addEventListener('click', function() {
+                if (!confirm('Are you sure you want to report this article for review?')) {
+                    return;
+                }
+                this.disabled = true;
+                this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Reporting...';
+                fetch(`/report_article/${articleHashIdGlobal}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                .then(res => res.json().then(data => ({ ok: res.ok, status: res.status, data })))
+                .then(({ ok, status, data }) => {
+                    if (ok) {
+                        this.innerHTML = '<i class="fas fa-check"></i> Reported';
+                        alert(data.message);
+                    } else {
+                        this.disabled = false;
+                        this.innerHTML = '<i class="fas fa-flag"></i> Report';
+                        alert('Error: ' + data.error);
+                    }
+                })
+                .catch(err => {
+                    console.error("Report error:", err);
+                    alert("A network error occurred. Please try again.");
+                    this.disabled = false;
+                    this.innerHTML = '<i class="fas fa-flag"></i> Report';
+                });
+            });
         }
 
         const bookmarkBtn = document.getElementById('bookmarkBtn');
         if (bookmarkBtn && isUserLoggedIn) {
             bookmarkBtn.addEventListener('click', function() {
-                const articleHashId = this.dataset.articleHashId; 
-                const isCommunity = this.dataset.isCommunity; 
-                const title = this.dataset.title; 
-                const sourceName = this.dataset.sourceName; 
-                const imageUrl = this.dataset.imageUrl; 
-                const description = this.dataset.description; 
+                const articleHashId = this.dataset.articleHashId;
+                const isCommunity = this.dataset.isCommunity;
+                const title = this.dataset.title;
+                const sourceName = this.dataset.sourceName;
+                const imageUrl = this.dataset.imageUrl;
+                const description = this.dataset.description;
                 const publishedAt = this.dataset.publishedAt;
                 fetch(`{{ url_for('toggle_bookmark', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_community_article: isCommunity, title, source_name: sourceName, image_url: imageUrl, description, published_at: publishedAt }) })
                 .then(res => res.json())
                 .then(data => {
                     if (data.success) {
-                        this.classList.toggle('active', data.status === 'added'); 
+                        this.classList.toggle('active', data.status === 'added');
                         this.title = data.status === 'added' ? 'Remove Bookmark' : 'Add Bookmark';
                     } else { alert('Error: ' + (data.error || 'Could not update bookmark.')); }
                 })
@@ -2564,11 +2842,23 @@ _COMMENT_TEMPLATE = """
         <div class="comment-avatar" title="{{ comment.author.name if comment.author else 'Unknown' }}">{{ (comment.author.name[0]|upper if comment.author and comment.author.name else 'U') }}</div>
         <div class="comment-body">
             <div class="comment-header">
-                {# THE CHANGE IS HERE: The span is now an <a> tag #}
                 <a href="{{ url_for('public_profile', username=comment.author.username) }}" class="comment-author text-decoration-none">{{ comment.author.name if comment.author else 'Anonymous' }}</a>
                 <span class="comment-date">{{ comment.timestamp | to_ist }}</span>
             </div>
+
+            {# This is the main content paragraph #}
             <p class="comment-content mb-2">{{ comment.content }}</p>
+
+            {# NEW: This is the hidden form for editing the comment #}
+            <div class="edit-form-container" style="display:none;">
+                <form class="edit-comment-form">
+                    <textarea class="form-control form-control-sm mb-2" name="content" rows="3" required>{{ comment.content }}</textarea>
+                    <div class="d-flex justify-content-end gap-2">
+                        <button type="button" class="btn btn-sm btn-outline-secondary cancel-edit-btn">Cancel</button>
+                        <button type="submit" class="btn btn-sm btn-primary">Save Changes</button>
+                    </div>
+                </form>
+            </div>
             
             {% if session.user_id %}
             <div class="comment-actions">
@@ -2579,6 +2869,12 @@ _COMMENT_TEMPLATE = """
                 </div>
                 <button class="react-btn" data-comment-id="{{ comment.id }}" title="React"><i class="far fa-smile"></i> React</button>
                 <button class="reply-btn" data-comment-id="{{ comment.id }}" title="Reply"><i class="fas fa-reply"></i> Reply</button>
+                
+                {# NEW: Edit and Delete buttons, only visible to the comment owner #}
+                {% if session.user_id == comment.user_id %}
+                    <button class="edit-btn" data-comment-id="{{ comment.id }}" title="Edit"><i class="fas fa-pencil-alt"></i> Edit</button>
+                    <button class="delete-btn" data-comment-id="{{ comment.id }}" title="Delete"><i class="fas fa-trash-alt"></i> Delete</button>
+                {% endif %}
             </div>
             <div class="reply-form-container" id="reply-form-container-{{ comment.id }}" style="display:none;">
                 <form class="reply-form">
@@ -2593,6 +2889,7 @@ _COMMENT_TEMPLATE = """
             {% endif %}
 
             <div class="reaction-summary" id="reaction-summary-{{ comment.id }}">
+                {# Reaction pills will be dynamically inserted here by JS #}
             </div>
         </div>
     </div>
