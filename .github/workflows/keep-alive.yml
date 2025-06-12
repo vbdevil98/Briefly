@@ -1,16 +1,17 @@
-# This is a name for your workflow, which you will see in the Actions tab
+# A name for your workflow
 name: Keep Render Service Alive
 
-# This section defines when the workflow runs
+# Defines the triggers for this workflow
 on:
+  # This is the automatic schedule trigger
   schedule:
-    # UPDATED: Runs every minute
+    # Runs every minute.
     - cron: '* * * * *'
-  
-  # This line allows you to run the workflow manually from the Actions tab
+
+  # This is the manual trigger button
   workflow_dispatch:
 
-# This section defines the actual jobs that will run
+# Defines the jobs to run
 jobs:
   ping:
     runs-on: ubuntu-latest
