@@ -1,7 +1,4 @@
-#Perfectly Working Code
-
-# Rev14.py - MODIFIED FOR ROBUST NEWS, COMMENTS, PROFILE, BOOKMARKS, AND AI DISPLAY FIXES
-
+Perfect code: 
 #!/usr/bin/env python
 # coding: utf-8
 
@@ -66,14 +63,14 @@ app.jinja_loader = DictLoader(template_storage)
 
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'YOUR_FALLBACK_FLASK_SECRET_KEY_HERE_32_CHARS')
 app.config['PER_PAGE'] = 9
-app.config['CATEGORIES'] = ['All Articles', 'Community Hub']
+app.config['CATEGORIES'] = ['All Articles', 'Popular Stories', "Yesterday's Headlines", 'Community Hub']
 
 app.config['NEWS_API_QUERY'] = 'India OR "Indian politics" OR "Indian economy" OR "Bollywood"'
 app.config['NEWS_API_DOMAINS'] = 'timesofindia.indiatimes.com,thehindu.com,ndtv.com,indianexpress.com,hindustantimes.com'
 app.config['NEWS_API_DAYS_AGO'] = 7 # Fetch news from the last 7 days
 app.config['NEWS_API_PAGE_SIZE'] = 100
 app.config['NEWS_API_SORT_BY'] = 'publishedAt' #relevance, popularity, publishedAt
-app.config['CACHE_EXPIRY_SECONDS'] = 7200 # 1 hour
+app.config['CACHE_EXPIRY_SECONDS'] = 1800 
 app.permanent_session_lifetime = timedelta(days=30)
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -205,12 +202,16 @@ class Comment(db.Model):
     replies = db.relationship('Comment', backref=db.backref('parent', remote_side=[id]), lazy='selectin', cascade="all, delete-orphan")
     votes = db.relationship('CommentVote', backref='comment', lazy='dynamic', cascade="all, delete-orphan")
 
+
 class CommentVote(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete="CASCADE"), nullable=False)
     comment_id = db.Column(db.Integer, db.ForeignKey('comment.id', ondelete="CASCADE"), nullable=False)
-    vote_type = db.Column(db.SmallInteger, nullable=False)
+    # MODIFIED: Changed to store the specific emoji character for the reaction.
+    vote_emoji = db.Column(db.String(10), nullable=False)
+    # The unique constraint ensures a user can only have one reaction per comment.
     __table_args__ = (db.UniqueConstraint('user_id', 'comment_id', name='_user_comment_uc'),)
+
 
 class Subscriber(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -328,8 +329,13 @@ def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
-            flash("You must be logged in to access this page.", "warning")
-            return redirect(url_for('login', next=request.url))
+            # Check if the request is an API/JSON request
+            if request.headers.get('Accept') == 'application/json':
+                return jsonify({"success": False, "error": "Authentication required. Please log in."}), 401
+            # Otherwise, it's a normal page load, so redirect to login page
+            else:
+                flash("You must be logged in to access this page.", "warning")
+                return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
 
@@ -365,6 +371,56 @@ def get_article_analysis_with_groq(article_text, article_title=""):
     except Exception as e:
         app.logger.error(f"Unexpected error during Groq analysis for '{article_title[:50]}': {e}", exc_info=True)
         return {"error": "An unexpected error occurred during AI analysis."}
+
+# In Rev14.py, add this new function
+
+@simple_cache(expiry_seconds_default=14400) # Cache the synthesis for 4 hours
+def get_daily_synthesis():
+    """
+    Fetches top stories and uses an LLM to create a high-level synthesis
+    of the day's main themes and extract keywords.
+    """
+    app.logger.info("Generating AI Daily Synthesis...")
+    if not groq_client:
+        return {"synthesis_text": None, "keywords": []}
+
+    # Get the articles to be synthesized
+    articles_to_synthesize = fetch_popular_news()
+    if not articles_to_synthesize:
+        return {"synthesis_text": None, "keywords": []}
+
+    # Prepare the content for the AI
+    # We'll combine titles and descriptions for a rich context
+    content_for_ai = ""
+    for art in articles_to_synthesize[:15]: # Use up to 15 articles for the context
+        content_for_ai += f"Title: {art.get('title', '')}\\nDescription: {art.get('description', '')}\\n\\n"
+
+    system_prompt = (
+        "You are a top-tier news editor for an Indian audience. Your task is to provide a 'big picture' summary of the day's news based on a collection of article titles and descriptions. "
+        "Analyze the provided text and generate a JSON object with two keys: 'synthesis_text' and 'keywords'. "
+        "1. For 'synthesis_text': Write a single, insightful, and cohesive paragraph (3-4 sentences) that synthesizes the most important themes, trends, or events of the day. Do not just list the news. Connect the ideas. "
+        "2. For 'keywords': Extract the 4-5 most significant and distinct keywords or key phrases from the articles. These should represent the main topics of the day."
+    )
+    
+    human_prompt = f"Here is the collection of today's news articles:\n\n{content_for_ai}"
+
+    try:
+        json_model = groq_client.bind(response_format={"type": "json_object"})
+        ai_response = json_model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)])
+        analysis = json.loads(ai_response.content)
+        
+        # Validate the response from the AI
+        synthesis = analysis.get("synthesis_text")
+        keywords = analysis.get("keywords")
+        if not isinstance(synthesis, str) or not isinstance(keywords, list):
+            raise ValueError("AI response did not have the correct format.")
+
+        app.logger.info(f"Successfully generated AI Daily Synthesis. Keywords: {keywords}")
+        return {"synthesis_text": synthesis, "keywords": keywords}
+
+    except Exception as e:
+        app.logger.error(f"Error during AI Daily Synthesis generation: {e}", exc_info=True)
+        return {"synthesis_text": "The AI summary for the day could not be generated at this time.", "keywords": []}
 
 # ==============================================================================
 # --- NEWS FETCHING ---
@@ -559,9 +615,147 @@ def fetch_news_from_api(target_date_str=None):
     app.logger.info(f"Total unique articles processed and returned by fetch_news_from_api: {len(processed_articles)} for period from {api_call_from_date_str} to {api_call_to_date_str}.")
     return processed_articles
 
-# This function should be defined in your Rev14.py,
-# likely after fetch_news_from_api and before the Flask routes section.
+@simple_cache(expiry_seconds_default=21600) # Cache popular news for 6 hours
+def fetch_popular_news():
+    """
+    Fetches articles from the last few days and sorts them by popularity
+    to find the most impactful stories.
+    """
+    app.logger.info("Fetching POPULAR news from API.")
+    if not newsapi:
+        return []
 
+    # Query a window of the last 5 days to get a good measure of popularity
+    to_date = datetime.now(timezone.utc) - timedelta(days=1)
+    from_date = to_date - timedelta(days=5)
+
+    try:
+        response = newsapi.get_everything(
+            q=app.config['NEWS_API_QUERY'],
+            language='en',
+            from_param=from_date.strftime('%Y-%m-%d'),
+            to=to_date.strftime('%Y-%m-%d'),
+            sort_by='popularity', # This is the key for this section
+            page_size=30
+        )
+        
+        if response.get('status') == 'ok':
+            raw_articles = response.get('articles', [])
+            processed_articles, unique_urls = [], set()
+            for art_data in raw_articles:
+                url = art_data.get('url')
+                if not url or url in unique_urls: continue
+                title = art_data.get('title')
+                description = art_data.get('description')
+
+                if not all([title, art_data.get('source'), description]) or title == '[Removed]' or not title.strip() or not description.strip():
+                    continue
+                
+                unique_urls.add(url)
+                article_id = generate_article_id(url)
+                source_name = art_data['source'].get('name', 'Unknown Source')
+                placeholder_text = urllib.parse.quote_plus(source_name[:20])
+                
+                published_at_dt = None
+                if art_data.get('publishedAt'):
+                    try:
+                        published_at_dt = datetime.fromisoformat(art_data.get('publishedAt').replace('Z', '+00:00'))
+                    except ValueError:
+                        published_at_dt = datetime.now(timezone.utc)
+                else:
+                    published_at_dt = datetime.now(timezone.utc)
+
+                standardized_article = {
+                    'id': article_id, 'title': title, 'description': description, 'url': url,
+                    'urlToImage': art_data.get('urlToImage') or f'https://via.placeholder.com/400x220/0D2C54/FFFFFF?text={placeholder_text}',
+                    'publishedAt': published_at_dt.isoformat(), 'source': {'name': source_name}, 
+                    'is_community_article': False, 'groq_summary': None, 'groq_takeaways': None
+                }
+                MASTER_ARTICLE_STORE[article_id] = standardized_article
+                processed_articles.append(standardized_article)
+            
+            app.logger.info(f"Returning {len(processed_articles)} unique POPULAR articles.")
+            return processed_articles
+        return []
+    except Exception as e:
+        app.logger.error(f"Exception in fetch_popular_news: {e}", exc_info=True)
+        return []
+
+@simple_cache(expiry_seconds_default=14400) # Cache yesterday's news for 4 hours
+def fetch_yesterdays_latest_news():
+    """
+    Fetches all articles specifically from yesterday, calculated correctly
+    using the Indian timezone, and sorts them by time.
+    """
+    app.logger.info("Fetching LATEST news from YESTERDAY from API.")
+    if not newsapi:
+        return []
+    
+    # 1. Get the current time in the Indian Timezone
+    now_in_ist = datetime.now(INDIAN_TIMEZONE)
+    
+    # 2. Calculate the start and end of "yesterday" in IST
+    yesterday_in_ist = now_in_ist - timedelta(days=1)
+    start_of_yesterday_ist = yesterday_in_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_yesterday_ist = yesterday_in_ist.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    # 3. Convert the IST start/end times to UTC for the API call
+    start_utc = start_of_yesterday_ist.astimezone(pytz.utc)
+    end_utc = end_of_yesterday_ist.astimezone(pytz.utc)
+
+    # 4. Format the UTC dates into the string format the API requires (THE FIX IS HERE)
+    from_param_str = start_utc.strftime('%Y-%m-%dT%H:%M:%S')
+    to_param_str = end_utc.strftime('%Y-%m-%dT%H:%M:%S')
+
+    app.logger.info(f"Querying for yesterday's news in UTC range: {from_param_str} to {to_param_str}")
+
+    try:
+        response = newsapi.get_everything(
+            q=app.config['NEWS_API_QUERY'],
+            language='en',
+            from_param=from_param_str,
+            to=to_param_str,
+            sort_by='publishedAt',
+            page_size=100
+        )
+        
+        if response.get('status') == 'ok':
+            raw_articles = response.get('articles', [])
+            processed_articles, unique_urls = [], set()
+            for art_data in raw_articles:
+                url = art_data.get('url')
+                if not url or url in unique_urls: continue
+                title = art_data.get('title')
+                description = art_data.get('description')
+                if not all([title, art_data.get('source'), description]) or title == '[Removed]' or not title.strip() or not description.strip():
+                    continue
+                unique_urls.add(url)
+                article_id = generate_article_id(url)
+                source_name = art_data['source'].get('name', 'Unknown Source')
+                placeholder_text = urllib.parse.quote_plus(source_name[:20])
+                published_at_dt = None
+                if art_data.get('publishedAt'):
+                    try:
+                        published_at_dt = datetime.fromisoformat(art_data.get('publishedAt').replace('Z', '+00:00'))
+                    except ValueError:
+                        published_at_dt = datetime.now(timezone.utc)
+                else:
+                    published_at_dt = datetime.now(timezone.utc)
+                standardized_article = {
+                    'id': article_id, 'title': title, 'description': description, 'url': url,
+                    'urlToImage': art_data.get('urlToImage') or f'https://via.placeholder.com/400x220/0D2C54/FFFFFF?text={placeholder_text}',
+                    'publishedAt': published_at_dt.isoformat(), 'source': {'name': source_name}, 
+                    'is_community_article': False, 'groq_summary': None, 'groq_takeaways': None
+                }
+                MASTER_ARTICLE_STORE[article_id] = standardized_article
+                processed_articles.append(standardized_article)
+            app.logger.info(f"Returning {len(processed_articles)} unique LATEST articles from YESTERDAY.")
+            return processed_articles
+        return []
+    except Exception as e:
+        app.logger.error(f"Exception in fetch_yesterdays_latest_news: {e}", exc_info=True)
+        return []
+        
 @simple_cache(expiry_seconds_default=3600 * 6)
 def fetch_and_parse_article_content(article_hash_id, url):
     app.logger.info(f"Fetching content for API article ID: {article_hash_id}, URL: {url}")
@@ -627,9 +821,6 @@ def fetch_and_parse_article_content(article_hash_id, url):
 # ==============================================================================
 # --- 6. Flask Routes ---
 # ==============================================================================
-# Rev14.py - MODIFIED FOR ROBUST NEWS, COMMENTS, PROFILE, BOOKMARKS, AI DISPLAY FIXES, AND DATE FILTER (v2)
-
-# ... (context_processor, get_paginated_articles, get_sort_key remain unchanged from previous response) ...
 @app.context_processor
 def inject_global_vars():
     return {'categories': app.config['CATEGORIES'],
@@ -663,6 +854,7 @@ def get_sort_key(article):
     elif isinstance(date_val, datetime): return date_val if date_val.tzinfo else pytz.utc.localize(date_val)
     return datetime.min.replace(tzinfo=timezone.utc)
 
+# In Rev14.py, find your existing index function and REPLACE IT with this entire block.
 
 @app.route('/')
 @app.route('/page/<int:page>')
@@ -671,68 +863,101 @@ def get_sort_key(article):
 def index(page=1, category_name='All Articles'):
     session['previous_list_page'] = request.full_path
     per_page = app.config['PER_PAGE']
-    all_display_articles_raw = []
     query_str = request.args.get('query')
-    filter_date_str = request.args.get('filter_date') # Will be passed to fetch_news_from_api
+    filter_date_str = request.args.get('filter_date')
 
-    # Validate filter_date_str format if present, clear if invalid
-    if filter_date_str:
-        try:
-            datetime.strptime(filter_date_str, '%Y-%m-%d') # Just validate
-            app.logger.info(f"Date filter active for 'All Articles': {filter_date_str}")
-        except ValueError:
-            app.logger.warning(f"Invalid filter_date format received: {filter_date_str}. Ignoring date filter.")
-            flash("Invalid date format for filter. Showing all latest articles instead.", "warning")
-            filter_date_str = None # Clear invalid date string for further processing
+    # This block handles the main homepage view
+    if page == 1 and category_name == 'All Articles' and not query_str and not filter_date_str:
+        app.logger.info("Rendering main homepage with AI Synthesis and other sections.")
+        
+        # --- NEW: Call the synthesis function ---
+        synthesis_data = get_daily_synthesis()
+        
+        # Fetch articles for the other sections
+        all_popular_articles = fetch_popular_news()
+        featured_article = all_popular_articles[0] if all_popular_articles else None
+        popular_articles = all_popular_articles[1:] if all_popular_articles else [] 
+        
+        latest_yesterday_articles = fetch_yesterdays_latest_news()
 
-    if category_name == 'Community Hub':
-        db_articles = CommunityArticle.query.options(joinedload(CommunityArticle.author)).order_by(CommunityArticle.published_at.desc()).all()
-        for art in db_articles:
-            art.is_community_article = True
-            all_display_articles_raw.append(art)
-    else: # 'All Articles'
-        # Pass filter_date_str to fetch_news_from_api. It will handle fetching for a specific date or default range.
-        api_articles = fetch_news_from_api(target_date_str=filter_date_str if category_name == 'All Articles' else None)
-        for art_dict in api_articles:
-            art_dict['is_community_article'] = False
-            all_display_articles_raw.append(art_dict)
+        POPULAR_NEWS_COUNT = 6
+        LATEST_NEWS_COUNT = 6
+        
+        user_bookmarks_hashes = set()
+        if 'user_id' in session:
+            bookmarks = BookmarkedArticle.query.filter_by(user_id=session['user_id']).all()
+            user_bookmarks_hashes = {b.article_hash_id for b in bookmarks}
 
-    all_display_articles_raw.sort(key=get_sort_key, reverse=True)
-    paginated_display_articles_raw, total_pages = get_paginated_articles(all_display_articles_raw, page, per_page)
-    
-    paginated_display_articles_with_bookmark_status = []
-    user_bookmarks_hashes = set()
-    if 'user_id' in session:
-        bookmarks = BookmarkedArticle.query.filter_by(user_id=session['user_id']).all()
-        user_bookmarks_hashes = {b.article_hash_id for b in bookmarks}
+        for art in ([featured_article] + popular_articles + latest_yesterday_articles):
+            if art:
+                art['is_bookmarked'] = art.get('id') in user_bookmarks_hashes
 
-    for art_item in paginated_display_articles_raw:
-        current_article_hash_id = None
-        if hasattr(art_item, 'is_community_article') and art_item.is_community_article:
-            current_article_hash_id = art_item.article_hash_id
-            art_item.is_bookmarked = current_article_hash_id in user_bookmarks_hashes
-            paginated_display_articles_with_bookmark_status.append(art_item)
-        elif isinstance(art_item, dict):
-            current_article_hash_id = art_item.get('id')
-            art_item_copy = art_item.copy()
-            art_item_copy['is_bookmarked'] = current_article_hash_id in user_bookmarks_hashes
-            paginated_display_articles_with_bookmark_status.append(art_item_copy)
+        return render_template("INDEX_HTML_TEMPLATE",
+                               # --- NEW: Pass synthesis data to the template ---
+                               synthesis=synthesis_data.get('synthesis_text'),
+                               keywords=synthesis_data.get('keywords', []),
+                               # --- Existing variables ---
+                               featured_article=featured_article,
+                               popular_articles=popular_articles[:POPULAR_NEWS_COUNT],
+                               latest_yesterday_articles=latest_yesterday_articles[:LATEST_NEWS_COUNT],
+                               selected_category=category_name,
+                               is_main_homepage=True,
+                               current_page=1, total_pages=1, query=None, current_filter_date=None)
+
+    # This 'else' block handles all other paginated views and remains unchanged
+    else:
+        app.logger.info(f"Rendering standard list view for: category='{category_name}', page='{page}'")
+        all_display_articles_raw = []
+        if category_name == 'Popular Stories':
+            all_display_articles_raw = fetch_popular_news()
+        elif category_name == "Yesterday's Headlines":
+            all_display_articles_raw = fetch_yesterdays_latest_news()
+        elif category_name == 'Community Hub':
+            db_articles = CommunityArticle.query.options(joinedload(CommunityArticle.author)).order_by(CommunityArticle.published_at.desc()).all()
+            for art in db_articles:
+                art.is_community_article = True
+            all_display_articles_raw.extend(db_articles)
         else:
-            paginated_display_articles_with_bookmark_status.append(art_item)
+            if filter_date_str:
+                try: datetime.strptime(filter_date_str, '%Y-%m-%d')
+                except ValueError: flash("Invalid date format.", "warning"); filter_date_str = None
+            api_articles = fetch_news_from_api(target_date_str=filter_date_str)
+            all_display_articles_raw.extend(api_articles)
+            
+        all_display_articles_raw.sort(key=get_sort_key, reverse=True)
+        paginated_display_articles_raw, total_pages = get_paginated_articles(all_display_articles_raw, page, per_page)
+        paginated_display_articles_with_bookmark_status = []
+        user_bookmarks_hashes = set()
+        if 'user_id' in session:
+            bookmarks = BookmarkedArticle.query.filter_by(user_id=session['user_id']).all()
+            user_bookmarks_hashes = {b.article_hash_id for b in bookmarks}
+        for art_item in paginated_display_articles_raw:
+            if hasattr(art_item, 'is_community_article') and art_item.is_community_article:
+                art_item.is_bookmarked = art_item.article_hash_id in user_bookmarks_hashes
+                paginated_display_articles_with_bookmark_status.append(art_item)
+            elif isinstance(art_item, dict):
+                art_item_copy = art_item.copy()
+                art_item_copy['is_bookmarked'] = art_item_copy.get('id') in user_bookmarks_hashes
+                paginated_display_articles_with_bookmark_status.append(art_item_copy)
+        return render_template("INDEX_HTML_TEMPLATE",
+                               articles=paginated_display_articles_with_bookmark_status,
+                               selected_category=category_name,
+                               is_main_homepage=False,
+                               current_page=page, total_pages=total_pages,
+                               featured_article_on_this_page=False,
+                               current_filter_date=filter_date_str, query=query_str)
 
-    # Featured article only if no search query and no date filter is active
-    featured_article_on_this_page = (page == 1 and category_name == 'All Articles' and not query_str and not filter_date_str and paginated_display_articles_with_bookmark_status)
+@app.route('/user/<username>')
+def public_profile(username):
+    user = User.query.filter_by(username=username).first_or_404()
     
-    return render_template("INDEX_HTML_TEMPLATE",
-                           articles=paginated_display_articles_with_bookmark_status,
-                           selected_category=category_name,
-                           current_page=page,
-                           total_pages=total_pages,
-                           featured_article_on_this_page=featured_article_on_this_page,
-                           current_filter_date=filter_date_str,
-                           query=query_str)
-
-# search_results route remains largely the same, ensuring current_filter_date=None is passed
+    # Fetch all articles posted by this user
+    posted_articles = CommunityArticle.query.filter_by(user_id=user.id)\
+        .order_by(CommunityArticle.published_at.desc())\
+        .all()
+        
+    return render_template("PUBLIC_PROFILE_HTML_TEMPLATE", user=user, posted_articles=posted_articles)
+    
 @app.route('/search')
 @app.route('/search/page/<int:page>')
 def search_results(page=1):
@@ -740,35 +965,79 @@ def search_results(page=1):
     query_str = request.args.get('query', '').strip()
     per_page = app.config['PER_PAGE']
 
-    if not query_str: return redirect(url_for('index'))
-    app.logger.info(f"Search query: '{query_str}'")
+    if not query_str:
+        return redirect(url_for('index'))
+
+    app.logger.info(f"Performing LIVE API search for query: '{query_str}'")
     
-    # Search should ideally search through all available articles, not just date-filtered ones.
-    # For simplicity with MASTER_ARTICLE_STORE, we ensure it's populated with general news.
-    # If MASTER_ARTICLE_STORE could be filtered by a date from a previous call, search might be limited.
-    # To ensure search is broad, we can call fetch_news_from_api() without a date to populate MASTER_ARTICLE_STORE.
-    if not MASTER_ARTICLE_STORE: # Or if you want to ensure it has the latest general set for searching
-        fetch_news_from_api() # Fetches default 7 days
+    # --- NEW: Live Search Logic ---
+    api_articles = []
+    if newsapi:
+        try:
+            # Perform a live search against the NewsAPI for the user's query
+            search_response = newsapi.get_everything(
+                q=query_str,
+                language='en',
+                sort_by='relevancy', # Sort by the most relevant articles for the query
+                page_size=100 # Get a full set of results for pagination
+            )
 
-    api_results = []
-    for art_id, art_data in MASTER_ARTICLE_STORE.items(): # Search all in-memory API articles
-        if query_str.lower() in art_data.get('title', '').lower() or \
-           query_str.lower() in art_data.get('description', '').lower():
-            art_copy = art_data.copy()
-            art_copy['is_community_article'] = False
-            api_results.append(art_copy)
+            if search_response.get('status') == 'ok':
+                # Process the results just like our other fetch functions
+                raw_articles = search_response.get('articles', [])
+                unique_urls = set()
+                for art_data in raw_articles:
+                    url = art_data.get('url')
+                    if not url or url in unique_urls: continue
+                    title = art_data.get('title')
+                    description = art_data.get('description')
+                    if not all([title, description, art_data.get('source')]) or title == '[Removed]':
+                        continue
+                    
+                    unique_urls.add(url)
+                    article_id = generate_article_id(url)
+                    source_name = art_data['source'].get('name', 'Unknown Source')
+                    placeholder_text = urllib.parse.quote_plus(source_name[:20])
+                    published_at_dt = None
+                    if art_data.get('publishedAt'):
+                        try: published_at_dt = datetime.fromisoformat(art_data.get('publishedAt').replace('Z', '+00:00'))
+                        except ValueError: published_at_dt = datetime.now(timezone.utc)
+                    else:
+                        published_at_dt = datetime.now(timezone.utc)
+                    
+                    standardized_article = {
+                        'id': article_id, 'title': title, 'description': description, 'url': url,
+                        'urlToImage': art_data.get('urlToImage') or f'https://via.placeholder.com/400x220/0D2C54/FFFFFF?text={placeholder_text}',
+                        'publishedAt': published_at_dt.isoformat(), 'source': {'name': source_name},
+                        'is_community_article': False
+                    }
+                    MASTER_ARTICLE_STORE[article_id] = standardized_article # Add to cache
+                    api_articles.append(standardized_article)
+            else:
+                app.logger.error(f"NewsAPI error on search: {search_response.get('message')}")
+                flash(f"Could not perform search at this time. Error: {search_response.get('message')}", "danger")
 
-    community_db_articles_query = CommunityArticle.query.options(joinedload(CommunityArticle.author)).filter(
-        db.or_(CommunityArticle.title.ilike(f'%{query_str}%'), CommunityArticle.description.ilike(f'%{query_str}%'))).order_by(CommunityArticle.published_at.desc())
+        except Exception as e:
+            app.logger.error(f"Exception during API search for '{query_str}': {e}", exc_info=True)
+            flash("An unexpected error occurred during the search.", "danger")
+    
+    # Also search our own community-posted articles
     community_db_articles = []
+    community_db_articles_query = CommunityArticle.query.options(joinedload(CommunityArticle.author)).filter(
+        db.or_(CommunityArticle.title.ilike(f'%{query_str}%'), CommunityArticle.description.ilike(f'%{query_str}%'))
+    ).order_by(CommunityArticle.published_at.desc())
     for art in community_db_articles_query.all():
         art.is_community_article = True
         community_db_articles.append(art)
 
-    all_search_results_raw = api_results + community_db_articles
+    # Combine and sort results
+    all_search_results_raw = api_articles + community_db_articles
     all_search_results_raw.sort(key=get_sort_key, reverse=True)
+
+    # Paginate the combined results
     paginated_search_articles_raw, total_pages = get_paginated_articles(all_search_results_raw, page, per_page)
 
+    # Add bookmark status to the paginated results
     paginated_search_articles_with_bookmark_status = []
     user_bookmarks_hashes = set()
     if 'user_id' in session:
@@ -776,71 +1045,91 @@ def search_results(page=1):
         user_bookmarks_hashes = {b.article_hash_id for b in bookmarks}
 
     for art_item in paginated_search_articles_raw:
-        current_article_hash_id = None
         if hasattr(art_item, 'is_community_article') and art_item.is_community_article:
-            current_article_hash_id = art_item.article_hash_id
-            art_item.is_bookmarked = current_article_hash_id in user_bookmarks_hashes
+            art_item.is_bookmarked = art_item.article_hash_id in user_bookmarks_hashes
             paginated_search_articles_with_bookmark_status.append(art_item)
         elif isinstance(art_item, dict):
-            current_article_hash_id = art_item.get('id')
             art_item_copy = art_item.copy()
-            art_item_copy['is_bookmarked'] = current_article_hash_id in user_bookmarks_hashes
+            art_item_copy['is_bookmarked'] = art_item_copy.get('id') in user_bookmarks_hashes
             paginated_search_articles_with_bookmark_status.append(art_item_copy)
-        else:
-            paginated_search_articles_with_bookmark_status.append(art_item)
             
     return render_template("INDEX_HTML_TEMPLATE",
                            articles=paginated_search_articles_with_bookmark_status,
                            selected_category=f"Search: {query_str}",
                            current_page=page,
                            total_pages=total_pages,
+                           is_main_homepage=False,
                            featured_article_on_this_page=False,
                            query=query_str,
-                           current_filter_date=None) # Search results don't use date filter
+                           current_filter_date=None)
 
-# ... (article_detail, get_article_content_json, add_comment, vote_comment, post_article, register, login, logout, about, contact, privacy, subscribe, toggle_bookmark, profile, errorhandlers remain unchanged from the previous correct version) ...
-# For brevity, only index and search_results are fully shown. Ensure other routes are correctly in place.
 @app.route('/article/<article_hash_id>')
 def article_detail(article_hash_id):
-    article_data, is_community_article, comments_for_template, all_article_comments_list, comment_data = None, False, [], [], {}
+    article_data, is_community_article, is_bookmarked = None, False, False
     previous_list_page = session.get('previous_list_page', url_for('index'))
+
     article_db = CommunityArticle.query.options(joinedload(CommunityArticle.author)).filter_by(article_hash_id=article_hash_id).first()
-    is_bookmarked = False
     if article_db:
-        article_data = article_db
-        is_community_article = True
-        try: article_data.parsed_takeaways = json.loads(article_data.groq_takeaways) if article_data.groq_takeaways else []
-        except json.JSONDecodeError:
-            app.logger.error(f"JSONDecodeError for groq_takeaways on community article {article_data.article_hash_id}")
-            article_data.parsed_takeaways = []
-        all_article_comments_list = Comment.query.options(joinedload(Comment.author), joinedload(Comment.replies).options(joinedload(Comment.author))).filter_by(community_article_id=article_db.id).order_by(Comment.timestamp.asc()).all()
-        comments_for_template = [c for c in all_article_comments_list if c.parent_id is None]
+        article_data, is_community_article = article_db, True
+        if article_data.groq_takeaways:
+            try: article_data.parsed_takeaways = json.loads(article_data.groq_takeaways)
+            except json.JSONDecodeError: article_data.parsed_takeaways = []
     else:
-        if not MASTER_ARTICLE_STORE: fetch_news_from_api() # Default fetch if store is empty
+        if not MASTER_ARTICLE_STORE: fetch_news_from_api()
         article_api_dict = MASTER_ARTICLE_STORE.get(article_hash_id)
         if article_api_dict:
-            article_data = article_api_dict.copy()
-            is_community_article = False
-            all_article_comments_list = Comment.query.options(joinedload(Comment.author), joinedload(Comment.replies).options(joinedload(Comment.author))).filter_by(api_article_hash_id=article_hash_id).order_by(Comment.timestamp.asc()).all()
-            comments_for_template = [c for c in all_article_comments_list if c.parent_id is None]
+            article_data, is_community_article = article_api_dict.copy(), False
         else:
             flash("Article not found.", "danger"); return redirect(previous_list_page)
-    if 'user_id' in session and article_data:
-        existing_bookmark = BookmarkedArticle.query.filter_by(user_id=session['user_id'], article_hash_id=article_hash_id).first()
-        if existing_bookmark: is_bookmarked = True
-    if all_article_comments_list:
-        comment_ids = [c.id for c in all_article_comments_list]
-        for c_id in comment_ids: comment_data[c_id] = {'likes': 0, 'dislikes': 0, 'user_vote': 0}
-        vote_counts_query = db.session.query(CommentVote.comment_id, func.sum(case((CommentVote.vote_type == 1, 1), else_=0)).label('likes'), func.sum(case((CommentVote.vote_type == -1, 1), else_=0)).label('dislikes')).filter(CommentVote.comment_id.in_(comment_ids)).group_by(CommentVote.comment_id).all()
-        for c_id, likes, dislikes in vote_counts_query:
-            if c_id in comment_data: comment_data[c_id]['likes'] = likes; comment_data[c_id]['dislikes'] = dislikes
+
+    if 'user_id' in session:
+        is_bookmarked = bool(BookmarkedArticle.query.filter_by(user_id=session['user_id'], article_hash_id=article_hash_id).first())
+
+    # --- SIMPLIFIED & STABLE COMMENT HANDLING ---
+    comment_data, total_comment_count = {}, 0
+    
+    # Define a base query for all comments on this article, loading authors efficiently.
+    base_comments_query = None
+    if is_community_article:
+        base_comments_query = Comment.query.options(joinedload(Comment.author)).filter_by(community_article_id=article_data.id)
+    else:
+        base_comments_query = Comment.query.options(joinedload(Comment.author)).filter_by(api_article_hash_id=article_hash_id)
+
+    # 1. Get ALL comments (including replies) to process reactions.
+    all_comments_in_thread = base_comments_query.all()
+    total_comment_count = len(all_comments_in_thread)
+    all_comment_ids = {c.id for c in all_comments_in_thread}
+
+    # 2. Fetch reaction data for all comments in a single batch.
+    if all_comment_ids:
+        for c_id in all_comment_ids: comment_data[c_id] = {'reactions': {}, 'user_reaction': None}
+        
+        reaction_counts = db.session.query(
+            CommentVote.comment_id, CommentVote.vote_emoji, func.count(CommentVote.vote_emoji)
+        ).filter(CommentVote.comment_id.in_(all_comment_ids)).group_by(CommentVote.comment_id, CommentVote.vote_emoji).all()
+        for c_id, emoji, count in reaction_counts:
+            if c_id in comment_data: comment_data[c_id]['reactions'][emoji] = count
+
         if 'user_id' in session:
-            user_votes = CommentVote.query.filter(CommentVote.comment_id.in_(comment_ids), CommentVote.user_id == session['user_id']).all()
-            for vote in user_votes:
-                if vote.comment_id in comment_data: comment_data[vote.comment_id]['user_vote'] = vote.vote_type
+            user_reactions = CommentVote.query.filter(CommentVote.comment_id.in_(all_comment_ids), CommentVote.user_id==session['user_id']).all()
+            for vote in user_reactions:
+                if vote.comment_id in comment_data: comment_data[vote.comment_id]['user_reaction'] = vote.vote_emoji
+
+    # 3. Fetch only the TOP-LEVEL comments to start the template loop.
+    # The 'replies' relationship in the model will handle fetching children.
+    comments_for_template = base_comments_query.filter(Comment.parent_id.is_(None)).order_by(Comment.timestamp.asc()).all()
+
     if isinstance(article_data, dict): article_data['is_community_article'] = False
     elif article_data: article_data.is_community_article = True
-    return render_template("ARTICLE_HTML_TEMPLATE", article=article_data, is_community_article=is_community_article, comments=comments_for_template, comment_data=comment_data, previous_list_page=previous_list_page, is_bookmarked=is_bookmarked)
+            
+    return render_template("ARTICLE_HTML_TEMPLATE", 
+                           article=article_data, 
+                           is_community_article=is_community_article, 
+                           comments=comments_for_template, 
+                           comment_data=comment_data,
+                           total_comment_count=total_comment_count,
+                           previous_list_page=previous_list_page, 
+                           is_bookmarked=is_bookmarked)
 
 @app.route('/get_article_content/<article_hash_id>')
 def get_article_content_json(article_hash_id):
@@ -853,42 +1142,102 @@ def get_article_content_json(article_hash_id):
     processed_content = fetch_and_parse_article_content(article_hash_id, article_data['url'])
     return jsonify(processed_content)
 
+# In Rev14.py, replace the entire add_comment function with this definitive version.
+
 @app.route('/add_comment/<article_hash_id>', methods=['POST'])
 @login_required
 def add_comment(article_hash_id):
     content = request.json.get('content', '').strip()
     parent_id = request.json.get('parent_id')
-    if not content: return jsonify({"error": "Comment cannot be empty."}), 400
+    if not content:
+        return jsonify({"success": False, "error": "Comment cannot be empty."}), 400
+    
     user = User.query.get(session['user_id'])
-    if not user: app.logger.error(f"User not found in add_comment for user_id {session.get('user_id')}"); return jsonify({"error": "User not found."}), 401
-    new_comment = None
-    community_article = CommunityArticle.query.filter_by(article_hash_id=article_hash_id).first()
-    if community_article: new_comment = Comment(content=content, user_id=user.id, community_article_id=community_article.id, parent_id=parent_id)
-    elif article_hash_id in MASTER_ARTICLE_STORE: new_comment = Comment(content=content, user_id=user.id, api_article_hash_id=article_hash_id, parent_id=parent_id)
-    else:
-        fetch_news_from_api()
-        if article_hash_id in MASTER_ARTICLE_STORE: new_comment = Comment(content=content, user_id=user.id, api_article_hash_id=article_hash_id, parent_id=parent_id)
-        else: return jsonify({"error": "Article not found to comment on."}), 404
-    db.session.add(new_comment); db.session.commit(); db.session.refresh(new_comment)
-    author_name = new_comment.author.name if new_comment.author else "Anonymous"
-    return jsonify({"success": True, "comment": {"id": new_comment.id, "content": new_comment.content, "timestamp": new_comment.timestamp.isoformat() + 'Z', "author": {"name": author_name }, "parent_id": new_comment.parent_id, "likes": 0, "dislikes": 0, "user_vote": 0}}), 201
+    if not user:
+        # This is a fallback, the decorator should handle it.
+        return jsonify({"success": False, "error": "User not found."}), 401
 
+    # --- ROBUST LOGIC ---
+    # The new logic is simpler and more reliable.
+    # It trusts the article_hash_id from the page the user is on.
+    
+    new_comment = Comment(content=content, user_id=user.id, parent_id=parent_id)
+    
+    # First, check if it's a permanent community article from our database.
+    community_article = CommunityArticle.query.filter_by(article_hash_id=article_hash_id).first()
+    
+    if community_article:
+        # If it is, link the comment to it.
+        new_comment.community_article_id = community_article.id
+    else:
+        # If not, assume it's an API article and save the hash ID.
+        # We no longer check against the volatile MASTER_ARTICLE_STORE cache.
+        new_comment.api_article_hash_id = article_hash_id
+
+    try:
+        db.session.add(new_comment)
+        db.session.commit()
+        db.session.refresh(new_comment)
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error saving comment to database: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "A database error occurred. Could not save comment."}), 500
+
+    # Render the new comment's HTML on the server.
+    comment_html = render_template("_COMMENT_TEMPLATE", comment=new_comment, session=session)
+
+    return jsonify({
+        "success": True, 
+        "html": comment_html,
+        "parent_id": new_comment.parent_id
+    }), 201
+    
 @app.route('/vote_comment/<int:comment_id>', methods=['POST'])
 @login_required
 def vote_comment(comment_id):
     comment = Comment.query.get_or_404(comment_id)
-    vote_type = request.json.get('vote_type')
-    if vote_type not in [1, -1]: return jsonify({"error": "Invalid vote type."}), 400
+    emoji = request.json.get('emoji')
+    
+    # Define the set of allowed emojis for reactions.
+    allowed_emojis = ['👍', '❤️', '😂', '😮', '😢', '😠']
+    if not emoji or emoji not in allowed_emojis:
+        return jsonify({"error": "Invalid reaction."}), 400
+
     existing_vote = CommentVote.query.filter_by(user_id=session['user_id'], comment_id=comment_id).first()
-    new_user_vote_status = 0
+    
+    user_reaction_after_vote = None
+    
     if existing_vote:
-        if existing_vote.vote_type == vote_type: db.session.delete(existing_vote); new_user_vote_status = 0
-        else: existing_vote.vote_type = vote_type; new_user_vote_status = vote_type
-    else: db.session.add(CommentVote(user_id=session['user_id'], comment_id=comment_id, vote_type=vote_type)); new_user_vote_status = vote_type
+        # If the user clicks the same emoji again, it's an "un-react", so we delete the vote.
+        if existing_vote.vote_emoji == emoji:
+            db.session.delete(existing_vote)
+            user_reaction_after_vote = None
+        # If they click a different emoji, we update their existing vote.
+        else:
+            existing_vote.vote_emoji = emoji
+            user_reaction_after_vote = emoji
+    # If no vote exists from this user, create a new one.
+    else:
+        new_vote = CommentVote(user_id=session['user_id'], comment_id=comment_id, vote_emoji=emoji)
+        db.session.add(new_vote)
+        user_reaction_after_vote = emoji
+        
     db.session.commit()
-    likes = CommentVote.query.filter_by(comment_id=comment_id, vote_type=1).count()
-    dislikes = CommentVote.query.filter_by(comment_id=comment_id, vote_type=-1).count()
-    return jsonify({"success": True, "likes": likes, "dislikes": dislikes, "user_vote": new_user_vote_status}), 200
+
+    # After any change, recalculate all reaction counts for this specific comment.
+    reaction_counts_query = db.session.query(
+        CommentVote.vote_emoji,
+        func.count(CommentVote.vote_emoji)
+    ).filter(CommentVote.comment_id == comment_id).group_by(CommentVote.vote_emoji).all()
+    
+    # Format the counts into a dictionary for the frontend.
+    reactions = {emo: count for emo, count in reaction_counts_query}
+
+    return jsonify({
+        "success": True, 
+        "reactions": reactions, 
+        "user_reaction": user_reaction_after_vote
+    }), 200
 
 @app.route('/post_article', methods=['POST'])
 @login_required
@@ -1037,237 +1386,522 @@ BASE_HTML_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}BrieflyAI{% endblock %}</title>
+    <title>{% block title %}Briefly{% endblock %}</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@600;700;800&family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Poppins:wght@600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --primary-color: #0A2342; --primary-light: #1E3A5E;
-            --secondary-color: #B8860B; --secondary-light: #D4A017;
-            --accent-color: #F07F2D; --text-color: #343a40;
-            --text-muted-color: #6c757d; --light-bg: #F8F9FA;
-            --white-bg: #FFFFFF; --card-border-color: #E0E0E0;
-            --footer-bg: #061A30; --footer-text: rgba(255,255,255,0.8);
-            --footer-link-hover: var(--secondary-color);
-            --primary-gradient: linear-gradient(135deg, var(--primary-color), var(--primary-light));
-            --primary-color-rgb: 10, 35, 66; --secondary-color-rgb: 184, 134, 11;
-            --bookmark-active-color: var(--accent-color);
+            --primary-color: #4F46E5; --primary-light: #6366F1; --primary-dark: #4338CA; --secondary-color: #14B8A6; --secondary-light: #2DD4BF; --accent-color: #F97316; --text-color: #1F2937; --text-muted-color: #6B7280; --light-bg: #F9FAFB; --card-bg: #FFFFFF; --card-border-color: #E5E7EB; --footer-bg: #111827; --footer-text: #D1D5DB; --footer-link-hover: var(--primary-light);
+            --primary-color-rgb: 79, 70, 229; --secondary-color-rgb: 20, 184, 166; --text-muted-color-rgb: 107, 114, 128;
+            --bookmark-active-color: var(--secondary-color);
+            --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05); --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1); --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+            --border-radius-sm: 0.375rem; --border-radius-md: 0.5rem; --border-radius-lg: 0.75rem;
         }
-        body { padding-top: 145px; font-family: 'Roboto', sans-serif; line-height: 1.65; color: var(--text-color); background-color: var(--light-bg); display: flex; flex-direction: column; min-height: 100vh; transition: background-color 0.3s ease, color 0.3s ease; }
+        body { padding-top: 85px; font-family: 'Inter', sans-serif; line-height: 1.65; color: var(--text-color); background-color: var(--light-bg); display: flex; flex-direction: column; min-height: 100vh; transition: background-color 0.3s ease, color 0.3s ease; }
         .main-content { flex-grow: 1; }
         body.dark-mode {
-            --primary-color: #1E3A5E; --primary-light: #2A4B7C; --secondary-color: #D4A017; --secondary-light: #E7B400; --accent-color: #FF983E; --text-color: #E9ECEF; --text-muted-color: #ADB5BD; --light-bg: #121212; --white-bg: #1E1E1E; --card-border-color: #333333; --footer-bg: #0A0A0A; --footer-text: rgba(255,255,255,0.7); --primary-color-rgb: 30, 58, 94; --secondary-color-rgb: 212, 160, 23;
+            --primary-color: #6366F1; --primary-light: #818CF8; --primary-dark: #4F46E5; --secondary-color: #2DD4BF; --secondary-light: #5EEAD4; --accent-color: #FB923C; --text-color: #F9FAFB; --text-muted-color: #9CA3AF; --light-bg: #111827; --card-bg: #1F2937; --card-border-color: #374151; --footer-bg: #000000; --footer-text: #9CA3AF;
+            --primary-color-rgb: 99, 102, 241; --secondary-color-rgb: 45, 212, 191; --text-muted-color-rgb: 156, 163, 175;
             --bookmark-active-color: var(--secondary-light);
         }
-        body.dark-mode .navbar-main { background: linear-gradient(135deg, #0A1A2F, #10233B); border-bottom: 1px solid #2A4B7C; }
-        body.dark-mode .category-nav { background: #1A1A1A; border-bottom: 1px solid #2A2A2A; }
-        body.dark-mode .category-link { color: var(--text-muted-color) !important; }
-        body.dark-mode .category-link.active { background: var(--primary-color) !important; color: var(--white-bg) !important; }
-        body.dark-mode .category-link:hover:not(.active) { background: #2C2C2C !important; color: var(--secondary-color) !important; }
-        body.dark-mode .article-card, body.dark-mode .featured-article, body.dark-mode .article-full-content-wrapper, body.dark-mode .auth-container, body.dark-mode .static-content-wrapper, body.dark-mode .profile-card { background-color: var(--white-bg); border-color: var(--card-border-color); }
-        body.dark-mode .article-title a, body.dark-mode h1, body.dark-mode h2, body.dark-mode h3, body.dark-mode h4, body.dark-mode h5, body.dark-mode .auth-title, body.dark-mode .profile-card h2 { color: var(--text-color) !important; }
-        body.dark-mode .article-description, body.dark-mode .meta-item, body.dark-mode .content-text p, body.dark-mode .article-meta-detailed, body.dark-mode .comment-content, body.dark-mode .comment-date, body.dark-mode .profile-card p { color: var(--text-muted-color) !important; }
-        body.dark-mode .read-more { background: var(--secondary-color); color: #000 !important; }
-        body.dark-mode .read-more:hover { background: var(--secondary-light); }
-        body.dark-mode .btn-outline-primary { color: var(--secondary-color); border-color: var(--secondary-color); }
-        body.dark-mode .btn-outline-primary:hover { background: var(--secondary-color); color: #000; }
-        body.dark-mode .modal-content { background-color: var(--white-bg); color: var(--text-color); border-color: var(--card-border-color);}
-        body.dark-mode .modal-form-control { background-color: #2C2C2C; color: var(--text-color); border-color: #444; }
-        body.dark-mode .modal-form-control::placeholder { color: var(--text-muted-color); }
-        body.dark-mode .close-modal { color: var(--text-muted-color); }
-        body.dark-mode .close-modal:hover { background: #2C2C2C; color: var(--text-color); }
-        body.dark-mode .page-link { background-color: var(--white-bg); border-color: var(--card-border-color); color: var(--secondary-color); }
-        body.dark-mode .page-item.active .page-link { background-color: var(--primary-color); border-color: var(--primary-color); color: var(--white-bg); }
-        body.dark-mode .page-item.disabled .page-link { background-color: var(--white-bg); color: var(--text-muted-color); }
-        body.dark-mode .page-link:hover:not(.active) { background-color: #2C2C2C; }
-        body.dark-mode .summary-box { background-color: rgba(var(--secondary-color-rgb), 0.05); border-color: rgba(var(--secondary-color-rgb), 0.2); }
-        body.dark-mode .summary-box h5 { color: var(--secondary-light); }
-        body.dark-mode .takeaways-box { background-color: rgba(var(--secondary-color-rgb), 0.05); border-left-color: var(--secondary-light); }
-        body.dark-mode .takeaways-box h5 { color: var(--secondary-light); }
-        body.dark-mode .content-text a {color: var(--secondary-light);}
-        body.dark-mode .content-text a:hover {color: var(--accent-color);}
-        body.dark-mode .loader { border-top-color: var(--secondary-color); }
-        body.dark-mode #dateFilterForm .form-control-sm { background-color: #2c2c2c; color: var(--text-color); border-color: #444; }
-        body.dark-mode #dateFilterForm .btn-outline-secondary { color: var(--text-muted-color); border-color: #444; }
-        body.dark-mode #dateFilterForm .btn-outline-secondary:hover { background-color: #333; color: var(--text-color); }
-        body.dark-mode #dateFilterForm .btn-outline-danger { color: #f5c6cb; border-color: #dc3545; } /* For clear button in dark mode */
-        body.dark-mode #dateFilterForm .btn-outline-danger:hover { background-color: #dc3545; color: #fff; }
-
-        .navbar-main { background: var(--primary-gradient); padding: 0.8rem 0; box-shadow: 0 4px 15px rgba(0,0,0,0.1); border-bottom: 2px solid rgba(255,255,255,0.15); transition: background 0.3s ease, border-bottom 0.3s ease; height: 95px; display: flex; align-items: center; }
-        .navbar-brand-custom { color: white !important; font-weight: 800; font-size: 2.2rem; letter-spacing: 0.5px; font-family: 'Poppins', sans-serif; margin-bottom: 0; display: flex; align-items: center; gap: 12px; text-decoration: none !important; }
-        .navbar-brand-custom .brand-icon { color: var(--secondary-light); font-size: 2.5rem; }
-        .navbar-brand-custom:hover { text-decoration: none !important; }
-        .search-form-container { flex-grow: 1; display: flex; justify-content: center; padding: 0 1rem; }
-        .search-container { position: relative; width: 100%; max-width: 550px; }
-        .navbar-search { border-radius: 25px; padding: 0.7rem 1.25rem 0.7rem 2.8rem; border: 1px solid rgba(255,255,255,0.2); font-size: 0.95rem; transition: all 0.3s ease; background: rgba(255,255,255,0.1); color: white; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-        .navbar-search::placeholder { color: rgba(255,255,255,0.6); }
-        .navbar-search:focus { background: rgba(255,255,255,0.2); box-shadow: 0 0 0 3px rgba(var(--secondary-color-rgb),0.3); border-color: var(--secondary-color); outline: none; color:white; }
-        .search-icon { color: rgba(255,255,255,0.7); transition: all 0.3s ease; left: 1rem; position: absolute; top: 50%; transform: translateY(-50%); }
-        .navbar-search:focus + .search-icon { color: var(--secondary-light); }
+        h1, h2, h3, h4, h5, .auth-title, .profile-card h2, .article-title-main, .modal-title { font-family: 'Poppins', sans-serif; font-weight: 700; }
+        .alert-top { position: fixed; top: 90px; left: 50%; transform: translateX(-50%); z-index: 2050; min-width:320px; text-align:center; box-shadow: var(--shadow-lg); border-radius: var(--border-radius-md); }
+        .navbar-main { background-color: var(--primary-color); padding: 0.75rem 0; box-shadow: var(--shadow-md); transition: background-color 0.3s ease; z-index: 1040; position: fixed; top: 0; width: 100%;}
+        .navbar-content-wrapper { display: flex; align-items: center; justify-content: space-between; gap: 1rem; width: 100%; }
+        .navbar-left { flex-shrink: 0; }
+        .navbar-center { flex-grow: 1; min-width: 150px; max-width: 550px; }
+        .navbar-right { flex-shrink: 0; }
+        .navbar-brand-custom { color: white !important; font-weight: 700; font-size: 2rem; font-family: 'Poppins', sans-serif; display: flex; align-items: center; gap: 10px; text-decoration: none !important; }
+        .navbar-brand-custom .brand-icon { color: var(--secondary-light); font-size: 2.2rem; }
+        .search-container { position: relative; width: 100%; }
+        .navbar-search { width: 100%; border-radius: 50px; padding: 0.6rem 1.25rem 0.6rem 2.8rem; border: 1px solid transparent; font-size: 0.95rem; transition: all 0.3s ease; background: rgba(255,255,255,0.15); color: white; }
+        .navbar-search::placeholder { color: rgba(255,255,255,0.7); }
+        .navbar-search:focus { background: rgba(255,255,255,0.25); box-shadow: 0 0 0 4px rgba(255,255,255,0.2); border-color: var(--secondary-light); outline: none; color:white; }
+        .search-icon { color: rgba(255,255,255,0.8); transition: all 0.3s ease; left: 1.1rem; position: absolute; top: 50%; transform: translateY(-50%); }
         .header-controls { display: flex; gap: 0.8rem; align-items: center; }
-        .header-btn { background: transparent; border: 1px solid rgba(255,255,255,0.3); padding: 0.5rem 1rem; border-radius: 20px; color: white; font-weight: 500; transition: all 0.3s ease; display: flex; align-items: center; gap: 0.5rem; cursor: pointer; text-decoration:none; font-size: 0.9rem; }
-        .header-btn:hover { background: var(--secondary-color); border-color: var(--secondary-color); color: var(--primary-color); transform: translateY(-1px); }
-        .dark-mode-toggle { font-size: 1.1rem; width: 40px; height: 40px; justify-content: center;}
-        .category-nav { background: var(--white-bg); box-shadow: 0 3px 10px rgba(0,0,0,0.03); position: fixed; top: 95px; width: 100%; z-index: 1020; border-bottom: 1px solid var(--card-border-color); transition: background 0.3s ease, border-bottom 0.3s ease; }
-        .categories-wrapper { display: flex; justify-content: center; align-items: center; width: 100%; overflow-x: auto; padding: 0.4rem 0.5rem; scrollbar-width: thin; scrollbar-color: var(--secondary-color) var(--light-bg); flex-wrap: nowrap; }
-        .categories-wrapper::-webkit-scrollbar { height: 6px; }
-        .categories-wrapper::-webkit-scrollbar-thumb { background: var(--secondary-color); border-radius: 3px; }
-        .category-links-container { display: flex; flex-shrink: 0; }
-        .category-link { color: var(--primary-color) !important; font-weight: 600; padding: 0.6rem 1.3rem !important; border-radius: 20px; transition: all 0.25s ease; white-space: nowrap; text-decoration: none; margin: 0 0.3rem; font-size: 0.9rem; border: 1px solid transparent; font-family: 'Roboto', sans-serif; }
-        .category-link.active { background: var(--primary-color) !important; color: white !important; box-shadow: 0 3px 10px rgba(var(--primary-color-rgb), 0.2); border-color: var(--primary-light); }
-        .category-link:hover:not(.active) { background: var(--light-bg) !important; color: var(--secondary-color) !important; border-color: var(--secondary-color); }
-        #dateFilterForm { flex-shrink: 0; }
-        .article-card, .featured-article, .article-full-content-wrapper, .auth-container, .static-content-wrapper, .profile-card { background: var(--white-bg); border-radius: 10px; transition: all 0.3s ease; border: 1px solid var(--card-border-color); box-shadow: 0 5px 15px rgba(0,0,0,0.05); }
-        .article-card:hover, .featured-article:hover { transform: translateY(-5px); box-shadow: 0 8px 25px rgba(0,0,0,0.08); }
-        .article-image-container { height: 200px; overflow: hidden; position: relative; border-top-left-radius: 9px; border-top-right-radius: 9px;}
+        .header-btn { background: transparent; border: 1px solid rgba(255,255,255,0.4); padding: 0.5rem 1rem; border-radius: 50px; color: white; font-weight: 500; transition: all 0.3s ease; display: flex; align-items: center; gap: 0.5rem; cursor: pointer; text-decoration:none; font-size: 0.9rem; }
+        .header-btn:hover { background: rgba(255,255,255,0.9); border-color: transparent; color: var(--primary-dark); }
+       
+        /* === UNIFIED OFFCANVAS SIDEBAR === */
+        .offcanvas { background-color: #111827; color: var(--footer-text); z-index: 1045; }
+        body.dark-mode .offcanvas { background-color: var(--footer-bg); }
+        .offcanvas-header { border-bottom-color: #374151 !important; }
+        .offcanvas-header .btn-close { filter: invert(1) grayscale(100%) brightness(200%); }
+        .sidebar-section { margin-bottom: 1.5rem; }
+        .sidebar-heading { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted-color); margin-bottom: 0.75rem; font-weight: 600; }
+        .sidebar-btn { display: flex; align-items: center; padding: 0.75rem 1rem; width: 100%; text-align: left; background-color: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white; text-decoration: none; border-radius: var(--border-radius-md); transition: all 0.2s ease; }
+        .sidebar-btn:hover { background-color: rgba(255,255,255,0.1); border-color: var(--primary-light); color: white; }
+        .sidebar-avatar { width: 40px; height: 40px; border-radius: 50%; background-color: var(--primary-color); color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.2rem; }
+        .offcanvas .dropdown-toggle { color: white; }
+        .offcanvas .dropdown-toggle::after { color: white; }
+        .offcanvas .dropdown-menu { background-color: #374151; border-color: #4B5563;}
+        .offcanvas .dropdown-item { color: var(--footer-text); }
+        .offcanvas .dropdown-item:hover { background-color: var(--primary-color); color: white; }
+        .offcanvas .nav-link { padding: 0.6rem 1rem; font-weight: 500; border-radius: var(--border-radius-sm); transition: background-color 0.2s ease, color 0.2s ease; color: var(--footer-text) !important; }
+        .offcanvas .nav-link.active { background-color: var(--primary-color); color: white !important; }
+        .offcanvas .nav-link:not(.active):hover { background-color: rgba(255,255,255,0.1); color: white !important; }
+        #dateFilterForm .form-control { background-color: #374151; border-color: #4B5563; color: white; }
+        #dateFilterForm .form-control:focus { background-color: #374151; border-color: var(--primary-color); box-shadow: none; color: white; }
+        #dateFilterForm .btn-primary { background-color: var(--primary-color); border-color: var(--primary-color); }
+        
+        .article-card, .article-full-content-wrapper, .auth-container, .profile-card { background: var(--card-bg); border-radius: var(--border-radius-lg); transition: all 0.3s ease; border: 1px solid var(--card-border-color); box-shadow: var(--shadow-md); }
+        .article-card:hover { transform: translateY(-5px); box-shadow: var(--shadow-lg); }
+        .article-image-container { height: 220px; overflow: hidden; position: relative; border-top-left-radius: var(--border-radius-lg); border-top-right-radius: var(--border-radius-lg);}
         .article-image { width: 100%; height: 100%; object-fit: cover; transition: transform 0.4s ease; }
-        .article-card:hover .article-image { transform: scale(1.08); }
-        .category-tag { position: absolute; top: 10px; left: 10px; background: var(--secondary-color); color: var(--primary-color); font-size: 0.65rem; font-weight: 700; padding: 0.3rem 0.7rem; border-radius: 15px; z-index: 5; text-transform: uppercase; letter-spacing: 0.3px; }
-        body.dark-mode .category-tag { color: var(--white-bg); background-color: var(--primary-light); }
-        .article-body { padding: 1.25rem; flex-grow: 1; display: flex; flex-direction: column; }
-        .article-title { font-weight: 700; line-height: 1.35; margin-bottom: 0.6rem; font-size:1.1rem; }
-        .article-title a { color: var(--primary-color); text-decoration: none; }
+        .article-card:hover .article-image { transform: scale(1.05); }
+        .article-body { padding: 1.5rem; flex-grow: 1; display: flex; flex-direction: column; }
+        .article-title { font-weight: 600; line-height: 1.4; margin-bottom: 0.6rem; font-size:1.15rem; }
+        .article-title a { color: var(--text-color); text-decoration: none; transition: color 0.2s ease; }
         .article-card:hover .article-title a { color: var(--primary-color) !important; }
-        body.dark-mode .article-card .article-title a { color: var(--text-color) !important; }
-        body.dark-mode .article-card:hover .article-title a { color: var(--secondary-color) !important; }
         .article-meta { display: flex; align-items: center; margin-bottom: 0.8rem; flex-wrap: wrap; gap: 0.4rem 1rem; }
         .meta-item { display: flex; align-items: center; font-size: 0.8rem; color: var(--text-muted-color); }
-        .meta-item i { font-size: 0.9rem; margin-right: 0.3rem; color: var(--secondary-color); }
-        .article-description { color: var(--text-muted-color); margin-bottom: 1rem; font-size: 0.9rem; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-        .read-more { margin-top: auto; background: var(--primary-color); color: white !important; border: none; padding: 0.5rem 0; border-radius: 6px; font-weight: 600; font-size: 0.85rem; transition: all 0.3s ease; width: 100%; text-align: center; text-decoration: none; display:inline-block; }
-        .read-more:hover { background: var(--primary-light); transform: translateY(-2px); color: white !important; }
-        body.dark-mode .read-more { background: var(--secondary-color); color: var(--primary-color) !important;}
-        body.dark-mode .read-more:hover { background: var(--secondary-light); }
-        .pagination { margin: 2rem 0; display: flex; justify-content: center; gap: 0.3rem; }
-        .page-item .page-link { border-radius: 50%; width: 40px; height: 40px; display:flex; align-items:center; justify-content:center; color: var(--primary-color); border: 1px solid var(--card-border-color); font-weight: 600; transition: all 0.2s ease; font-size:0.9rem; }
-        .page-item .page-link:hover { background-color: var(--light-bg); border-color: var(--secondary-color); color: var(--secondary-color); }
-        .page-item.active .page-link { background-color: var(--primary-color); border-color: var(--primary-color); color: white; box-shadow: 0 2px 8px rgba(var(--primary-color-rgb), 0.3); }
+        .meta-item i { font-size: 0.9rem; margin-right: 0.4rem; color: var(--secondary-color); }
+        .article-description { color: var(--text-muted-color); margin-bottom: 1.25rem; font-size: 0.95rem; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+        .read-more { margin-top: auto; background: var(--primary-color); color: white !important; border: none; padding: 0.6rem 0; border-radius: var(--border-radius-md); font-weight: 600; font-size: 0.9rem; transition: all 0.3s ease; width: 100%; text-align: center; text-decoration: none; display:inline-block; }
+        .read-more:hover { background: var(--primary-dark); transform: translateY(-2px); color: white !important; box-shadow: var(--shadow-md); }
+        .pagination { flex-wrap: wrap; }
+        .page-item .page-link { border-radius: 50%; width: 40px; height: 40px; display:flex; align-items:center; justify-content:center; color: var(--text-muted-color); background-color: var(--card-bg); border: 1px solid var(--card-border-color); font-weight: 600; transition: all 0.2s ease; font-size:0.9rem; margin: 0 0.2rem;}
+        .page-item.active .page-link { background-color: var(--primary-color); border-color: var(--primary-color); color: white; box-shadow: 0 2px 8px rgba(var(--primary-color-rgb), 0.4); }
         .page-item.disabled .page-link { color: var(--text-muted-color); pointer-events: none; background-color: var(--light-bg); }
-        .page-link-prev-next .page-link { width: auto; padding-left:1rem; padding-right:1rem; border-radius:20px; }
-        footer { background: var(--footer-bg); color: var(--footer-text); margin-top: auto; padding: 3rem 0 1.5rem; font-size:0.9rem; }
-        .footer-content { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 2rem; }
-        .footer-section h5 { color: var(--secondary-color); margin-bottom: 1rem; font-weight: 700; letter-spacing: 0.3px; position: relative; padding-bottom: 0.6rem; font-size: 1.1rem; }
-        .footer-section h5:after { content: ''; position: absolute; left: 0; bottom: 0; width: 35px; height: 2.5px; background: var(--secondary-light); }
-        .footer-links { display: flex; flex-direction: column; gap: 0.6rem; }
-        .footer-links a { color: var(--footer-text); text-decoration: none; transition: all 0.2s ease; display: flex; align-items: center; gap: 0.4rem; }
-        .footer-links a:hover { color: var(--footer-link-hover); transform: translateX(3px); }
-        .social-links { display: flex; gap: 0.8rem; margin-top: 0.5rem; }
-        .social-links a { color: var(--footer-text); font-size: 1.1rem; transition: all 0.2s ease; width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; border-radius: 50%; background: rgba(255,255,255,0.08); }
-        .social-links a:hover { color: var(--primary-color); background: var(--secondary-color); transform: translateY(-3px); }
-        .footer-brand-icon { color: var(--secondary-color); font-size: 1.8rem; }
-        .footer-brand-text { font-family: 'Poppins', sans-serif; font-weight: 700; color: white; }
-        .copyright { text-align: center; padding-top: 1.5rem; margin-top: 1.5rem; border-top: 1px solid rgba(255,255,255,0.1); font-size: 0.85rem; color: rgba(255,255,255,0.6); }
+        .page-link-prev-next .page-link { width: auto; padding-left:1.2rem; padding-right:1.2rem; border-radius:50px; }
+        footer { background: var(--footer-bg); color: var(--footer-text); margin-top: auto; padding: 3.5rem 0 1.5rem; font-size:0.9rem; }
+        .footer-content.row { display: flex; flex-wrap: wrap; }
+        .footer-section h5 { color: white; margin-bottom: 1.2rem; font-weight: 600; letter-spacing: 0.3px; font-size: 1.1rem; }
+        .footer-links { display: flex; flex-direction: column; gap: 0.8rem; }
+        .footer-links a { color: var(--footer-text); text-decoration: none; transition: all 0.2s ease; }
+        .footer-links a:hover { color: var(--footer-link-hover); padding-left: 5px; }
+        .social-links { display: flex; gap: 1rem; margin-top: 0.5rem; }
+        .social-links a { color: var(--footer-text); font-size: 1.2rem; transition: all 0.2s ease; }
+        .social-links a:hover { color: var(--secondary-light); transform: translateY(-2px); }
+        .copyright { text-align: center; padding-top: 2rem; margin-top: 2rem; border-top: 1px solid #374151; font-size: 0.85rem; color: var(--text-muted-color); width: 100%; }
+        .add-article-btn { width: 60px; height: 60px; border-radius: 50%; color: white; border: none; display: flex; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; background-image: linear-gradient(to right, var(--primary-color) 0%, var(--primary-light) 100%); box-shadow: 0 4px 15px rgba(var(--primary-color-rgb), 0.35); transition: all 0.3s ease-out; }
+        .add-article-btn:hover { transform: translateY(-4px) scale(1.05); box-shadow: 0 8px 25px rgba(var(--primary-color-rgb), 0.4); }
+        .page-header-static { background-color: var(--card-bg); border-radius: var(--border-radius-lg); padding: 2.5rem; margin-bottom: 2rem; text-align: center; border-left: 5px solid var(--primary-color); }
+        .page-header-static h1 { color: var(--text-color); font-size: 2.8rem; font-weight: 700; }
+        body.dark-mode .page-header-static h1 { color: var(--primary-light); }
+        .static-content-container { background-color: var(--card-bg); border-radius: var(--border-radius-lg); padding: clamp(1.5rem, 5vw, 3rem); font-size: 1.05rem; line-height: 1.8; box-shadow: var(--shadow-md); }
+        .static-content-container h2 { font-family: 'Poppins', sans-serif; color: var(--primary-dark); border-bottom: 2px solid var(--secondary-color); padding-bottom: 0.5rem; margin-top: 2.5rem; margin-bottom: 1.5rem; display: inline-block; }
+        .static-content-container h2 .icon { margin-right: 0.75rem; }
+        .static-content-container p.lead { font-size: 1.25rem; font-weight: 400; color: var(--text-muted-color); }
+        .static-content-container ul { padding-left: 25px; }
+        .static-content-container li { margin-bottom: 0.5rem; }
+        .contact-card { background-color: var(--light-bg); border: 1px solid var(--card-border-color); border-radius: var(--border-radius-md); padding: 1.5rem; height: 100%; text-align: center; transition: all 0.3s ease; }
+        .contact-card:hover { transform: translateY(-5px); box-shadow: var(--shadow-md); }
+        .contact-card .icon { font-size: 2.5rem; color: var(--primary-color); margin-bottom: 1rem; }
+        body.dark-mode .contact-card { background-color: var(--card-bg); }
+        .contact-social-links { display: flex; gap: 1.5rem; justify-content: center; font-size: 1.5rem; }
+        .contact-social-links a { color: var(--text-muted-color); transition: all 0.3s ease; }
+        .contact-social-links a:hover { color: var(--secondary-color); transform: scale(1.1); }
+        .auth-card { max-width: 480px; margin: 3rem auto; background: var(--card-bg); border-radius: var(--border-radius-lg); box-shadow: var(--shadow-lg); border: 1px solid var(--card-border-color); overflow: hidden; }
+        .auth-header { padding: 2rem; background-color: var(--primary-color); text-align: center; }
+        .auth-header .icon { font-size: 2.5rem; color: var(--secondary-light); }
+        .auth-header h2 { color: white; font-weight: 600; margin-top: 0.75rem; margin-bottom: 0; }
+        .auth-body { padding: 2rem 2.5rem; }
+        .input-group-icon { position: relative; }
+        .input-group-icon .form-control { padding-left: 2.5rem; }
+        .input-group-icon .input-icon { position: absolute; left: 0.75rem; top: 50%; transform: translateY(-50%); color: var(--text-muted-color); }
+        .auth-body .btn { padding: 0.75rem; font-weight: 600; font-size: 1rem; }
+        .profile-header-card { background: var(--card-bg); border-radius: var(--border-radius-lg); padding: 2rem; box-shadow: var(--shadow-md); display: flex; flex-direction: column; align-items: center; text-align: center; }
+        .profile-avatar-wrapper { position: relative; margin-bottom: 1rem; }
+        .profile-avatar { width: 120px; height: 120px; border-radius: 50%; background-image: linear-gradient(to top, var(--primary-color), var(--primary-light)); color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 3.5rem; font-family: 'Poppins', sans-serif; border: 5px solid var(--card-bg); box-shadow: var(--shadow-md); }
+        .profile-header-card h2 { margin-bottom: 0.25rem; font-size: 2rem; }
+        .profile-header-card .username { color: var(--text-muted-color); font-weight: 500; margin-bottom: 1rem; }
+        .profile-stats { display: flex; gap: 2rem; margin-top: 1.5rem; border-top: 1px solid var(--card-border-color); padding-top: 1.5rem; width: 100%; justify-content: center; }
+        .stat-item { text-align: center; }
+        .stat-item .icon { font-size: 1.5rem; color: var(--secondary-color); margin-bottom: 0.5rem; }
+        .stat-item .count { font-size: 1.25rem; font-weight: 700; color: var(--text-color); }
+        .stat-item .label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted-color); }
+        .profile-tabs .nav-link { padding: 0.75rem 1rem; }
+        .empty-state-card { background-color: var(--card-bg); border-radius: var(--border-radius-lg); text-align: center; padding: 3rem; border: 2px dashed var(--card-border-color); }
+        .empty-state-card .icon { font-size: 3.5rem; color: var(--text-muted-color); opacity: 0.5; margin-bottom: 1rem; }
         .admin-controls { position: fixed; bottom: 25px; right: 25px; z-index: 1030; }
-        .add-article-btn { width: 55px; height: 55px; border-radius: 50%; background: var(--secondary-color); color: var(--primary-color); border: none; box-shadow: 0 4px 15px rgba(var(--secondary-color-rgb),0.3); display: flex; align-items: center; justify-content: center; font-size: 22px; cursor: pointer; transition: all 0.3s ease; }
-        .add-article-btn:hover { transform: translateY(-4px) scale(1.05); box-shadow: 0 7px 20px rgba(var(--secondary-color-rgb),0.4); background: var(--secondary-light); }
-        .add-article-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 2000; background-color: rgba(0, 0, 0, 0.6); backdrop-filter: blur(5px); align-items: center; justify-content: center; }
-        .modal-content { width: 90%; max-width: 700px; background: var(--white-bg); border-radius: 10px; padding: 2rem; box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15); position: relative; animation: fadeInUp 0.3s ease-out; max-height: 90vh; overflow-y: auto;}
-        .close-modal { position: absolute; top: 12px; right: 12px; font-size: 20px; color: var(--text-muted-color); background: none; border: none; cursor: pointer; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.2s ease; }
-        .close-modal:hover { background: var(--light-bg); color: var(--text-color); }
-        .modal-form-group { margin-bottom: 1.2rem; }
-        .modal-form-group label { display: block; margin-bottom: 0.4rem; font-weight: 600; color: var(--text-color); font-size:0.9rem; }
-        .modal-form-control { width: 100%; padding: 0.65rem 0.9rem; border-radius: 6px; border: 1px solid var(--card-border-color); font-size: 0.95rem; transition: all 0.2s ease; background-color: var(--light-bg); }
-        .modal-form-control:focus { border-color: var(--primary-color); box-shadow: 0 0 0 3px rgba(var(--primary-color-rgb),0.15); outline: none; background-color: var(--white-bg); }
-        .modal-title {font-weight: 700; color: var(--primary-color); margin-bottom: 1.5rem !important;}
-        .btn-primary-modal { background-color: var(--primary-color); border-color: var(--primary-color); color:white; padding: 0.6rem 1.2rem; font-weight:600; }
-        .btn-primary-modal:hover { background-color: var(--primary-light); border-color: var(--primary-light); }
-        .btn-outline-secondary-modal { padding: 0.6rem 1.2rem; font-weight:600; border-color: var(--text-muted-color); color: var(--text-muted-color); }
-        body.dark-mode .btn-outline-secondary-modal { border-color: var(--text-muted-color); color: var(--text-muted-color); }
-        body.dark-mode .btn-outline-secondary-modal:hover { background-color: #333; color: var(--text-color); border-color: #444;}
-        .alert-top { position: fixed; top: 105px; left: 50%; transform: translateX(-50%); z-index: 2050; min-width:320px; text-align:center; box-shadow: 0 3px 10px rgba(0,0,0,0.1);}
-        .animate-fade-in { animation: fadeIn 0.5s ease-in-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(25px); } to { opacity: 1; transform: translateY(0); } }
-        .fade-in-delay-1 { animation-delay: 0.1s; } .fade-in-delay-2 { animation-delay: 0.2s; } .fade-in-delay-3 { animation-delay: 0.3s; }
-        .navbar-content-wrapper { display: flex; justify-content: space-between; align-items: center; width: 100%; }
-        .static-content-wrapper { padding: 2rem; margin-top: 1rem; }
-        .static-content-wrapper h1, .static-content-wrapper h2 { color: var(--primary-color); font-family: 'Poppins', sans-serif; }
-        body.dark-mode .static-content-wrapper h1, body.dark-mode .static-content-wrapper h2 { color: var(--secondary-color); }
-        @media (max-width: 991.98px) { 
-            body { padding-top: 180px; } 
-            .navbar-main { padding-bottom: 0.5rem; height: auto;}
-            .navbar-content-wrapper { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
-            .navbar-brand-custom { margin-bottom: 0.5rem; }
-            .search-form-container { width: 100%; order: 3; margin-top:0.5rem; padding: 0; }
-            .header-controls { position: absolute; top: 0.9rem; right: 1rem; order: 2; }
-            .category-nav { top: 130px; } 
-            .categories-wrapper { flex-wrap: wrap; justify-content: flex-start; } 
-            #dateFilterForm { width: 100%; margin-left: 0 !important; margin-top: 0.5rem; } 
+        .bookmark-btn { background: none; border: none; font-size: 1.6rem; color: var(--text-muted-color); cursor: pointer; padding: 0.25rem 0.5rem; transition: all 0.2s ease; vertical-align: middle; }
+        .bookmark-btn.active { color: var(--bookmark-active-color); transform: scale(1.1); }
+        .bookmark-btn:hover { color: var(--secondary-light); }
+        .article-card .bookmark-btn { font-size: 1.3rem; }
+        .bookmark-btn:focus { outline: none; box-shadow: none; }
+        
+        /* === COMMENT SECTION STYLES (IMPROVED) === */
+        .comment-section h3 { padding-bottom: 0.75rem; border-bottom: 1px solid var(--card-border-color); }
+        .comment-thread { position: relative; }
+        #comments-list > .comment-thread + .comment-thread { margin-top: 1.75rem; padding-top: 1.75rem; border-top: 1px solid var(--card-border-color); }
+        .comment-container { display: flex; gap: 1rem; align-items: flex-start; }
+        .comment-replies { margin-left: 3.5rem; padding-left: 1.25rem; margin-top: 1.25rem; border-left: 2px solid var(--card-border-color); }
+        .comment-replies > .comment-thread + .comment-thread { margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px dashed var(--card-border-color); }
+        .comment-avatar { width: 45px; height: 45px; border-radius: 50%; background: var(--primary-light); color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; flex-shrink: 0; }
+        .comment-replies .comment-avatar { width: 40px; height: 40px; }
+        .comment-body { flex-grow: 1; }
+        .comment-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.25rem; }
+        .comment-author { font-weight: 600; }
+        .comment-date { font-size: 0.8rem; color: var(--text-muted-color); }
+        .comment-content { word-wrap: break-word; }
+        .comment-actions { position: relative; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+        .comment-actions button { background: none; border: none; color: var(--text-muted-color); padding: 0.25rem 0.5rem; border-radius: var(--border-radius-md); font-size: 0.85rem; font-weight: 500; display: flex; align-items: center; gap: 0.3rem; transition: all 0.2s ease; }
+        .comment-actions button:hover { color: var(--primary-color); background-color: rgba(var(--primary-color-rgb), 0.1); }
+        .react-btn { position: relative; }
+        .reaction-box { display: none; position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; background-color: var(--card-bg); border: 1px solid var(--card-border-color); border-radius: 50px; padding: 4px 8px; box-shadow: var(--shadow-md); z-index: 10; white-space: nowrap; animation: fadeInUp 0.2s ease-out; }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .reaction-box.show { display: flex; gap: 5px; }
+        .reaction-emoji { font-size: 1.4rem; cursor: pointer; transition: transform 0.15s cubic-bezier(0.215, 0.610, 0.355, 1); padding: 2px; }
+        .reaction-emoji:hover { transform: scale(1.25); }
+        .reaction-summary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+        .reaction-pill { display: flex; align-items: center; background-color: rgba(var(--primary-color-rgb), 0.08); border: 1px solid transparent; border-radius: 20px; padding: 2px 8px; font-size: 0.8rem; font-weight: 500; cursor: default; transition: all 0.2s ease; }
+        .reaction-pill.user-reacted { background-color: var(--primary-color); color: white; border-color: var(--primary-dark); }
+        .reaction-pill .emoji { font-size: 0.9rem; margin-right: 4px; }
+        .reply-form-container { padding: 1rem; border-radius: var(--border-radius-md); margin-top: 0.75rem; background-color: var(--light-bg); border: 1px solid var(--card-border-color); }
+        
+        /* === FEATURED STORY & AI CARD SECTION === */
+        .featured-story { display: flex; } /* Ensure it's visible by default */
+        .ai-synthesis-card { display: block; } /* Ensure it's visible by default */
+        .featured-story {
+            background-color: var(--card-bg);
+            border-radius: var(--border-radius-lg);
+            box-shadow: var(--shadow-lg);
+            margin-bottom: 2.5rem;
+            overflow: hidden;
+            border: 1px solid var(--card-border-color);
+        }
+        .featured-story-image {
+            flex: 0 0 55%;
+            background-size: cover;
+            background-position: center;
+            min-height: 450px;
+        }
+        .featured-story-content {
+            flex: 0 0 45%;
+            padding: 2.5rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .featured-story-content .meta-item {
+            font-size: 0.9rem;
+        }
+        .featured-story-content h2 {
+            font-size: 2.2rem;
+            line-height: 1.3;
+            margin: 1rem 0;
+        }
+        .featured-story-content h2 a {
+            color: var(--text-color);
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+        .featured-story-content h2 a:hover {
+            color: var(--primary-color);
+        }
+        .featured-story-content .description {
+            font-size: 1.05rem;
+            color: var(--text-muted-color);
+            margin-bottom: 2rem;
+        }
+        .featured-story-content .read-more-btn {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 0.8rem 1.5rem;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            align-self: flex-start;
+        }
+        .featured-story-content .read-more-btn:hover {
+            background-color: var(--primary-dark);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+        .ai-synthesis-card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border-color);
+            border-radius: var(--border-radius-lg);
+            padding: 2rem;
+            margin-bottom: 2.5rem;
+            box-shadow: var(--shadow-lg);
+            position: relative;
+            overflow: hidden;
+        }
+        .ai-synthesis-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: linear-gradient(135deg, rgba(var(--primary-color-rgb), 0.05) 25%, transparent 25%),
+                              linear-gradient(225deg, rgba(var(--primary-color-rgb), 0.05) 25%, transparent 25%);
+            background-size: 20px 20px;
+            opacity: 0.5;
+        }
+        .synthesis-header {
+            text-align: center;
+            margin-bottom: 1.5rem;
+            position: relative;
+        }
+        .synthesis-header i {
+            font-size: 2rem;
+            color: var(--primary-color);
+        }
+        .synthesis-header h2 {
+            font-size: 1.5rem;
+            margin-top: 0.5rem;
+        }
+        .synthesis-text {
+            font-size: 1.15rem;
+            line-height: 1.7;
+            text-align: center;
+            color: var(--text-color);
+            position: relative;
+            font-family: 'Inter', serif;
+        }
+        .synthesis-keywords {
+            margin-top: 2rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--card-border-color);
+            text-align: center;
+            position: relative;
+        }
+        .synthesis-keywords .keyword-tag {
+            display: inline-block;
+            background-color: var(--light-bg);
+            border: 1px solid var(--card-border-color);
+            color: var(--text-muted-color);
+            padding: 0.4rem 1rem;
+            border-radius: 50px;
+            margin: 0.25rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-decoration: none;
+            transition: all 0.2s ease-in-out;
+        }
+        .synthesis-keywords .keyword-tag:hover {
+            background-color: var(--primary-color);
+            color: white;
+            border-color: var(--primary-color);
+            transform: translateY(-2px);
+        }
+
+        /*
+        ==========================================================================
+        === MOBILE RESPONSIVE STYLES ===
+        ==========================================================================
+        */
+        @media (max-width: 991.98px) {
+            .featured-story {
+                flex-direction: column;
+            }
+            .featured-story-image {
+                flex-basis: auto;
+                width: 100%;
+                min-height: 300px;
+            }
+            .featured-story-content {
+                flex-basis: auto;
+                padding: 2rem;
+            }
+            .featured-story-content h2 {
+                font-size: 2rem;
+            }
         }
         @media (max-width: 767.98px) {
-            body { padding-top: 170px; } 
-            .category-nav { top: 120px; } 
-            .featured-article .row { flex-direction: column; }
-            .featured-image { margin-bottom: 1rem; height: 250px; }
+            .navbar-center {
+                display: none;
+            }
+            .navbar-left {
+                flex-grow: 1;
+            }
+            .page-header-static h1 {
+                font-size: 2.2rem;
+            }
+            .featured-story-image {
+                min-height: 220px;
+            }
+            .featured-story-content {
+                padding: 1.5rem;
+            }
+            .featured-story-content h2 {
+                font-size: 1.6rem;
+            }
+            .footer-section {
+                text-align: center;
+            }
+            .footer-links {
+                align-items: center;
+            }
+            .social-links {
+                justify-content: center;
+            }
+            .footer-links a:hover {
+                padding-left: 0;
+            }
         }
         @media (max-width: 575.98px) {
-            .navbar-brand-custom { font-size: 1.8rem;}
-            .header-controls { gap: 0.3rem; }
-            .header-btn { padding: 0.4rem 0.8rem; font-size: 0.8rem; }
-            .dark-mode-toggle { font-size: 1rem; }
+            body {
+                font-size: 0.95rem;
+            }
+            .navbar-brand-custom {
+                font-size: 1.5rem;
+            }
+            .navbar-brand-custom .brand-icon {
+                font-size: 1.6rem;
+            }
+            .comment-replies {
+                margin-left: 1.25rem;
+                padding-left: 1rem;
+            }
+            .comment-container {
+                gap: 0.75rem;
+            }
+            .comment-avatar {
+                width: 40px;
+                height: 40px;
+            }
+            .comment-replies .comment-avatar {
+                width: 35px;
+                height: 35px;
+            }
+            .profile-avatar {
+                width: 100px;
+                height: 100px;
+                font-size: 3rem;
+            }
+            .profile-header-card h2 {
+                font-size: 1.5rem;
+            }
+            .profile-stats {
+                gap: 1rem;
+                flex-wrap: wrap;
+            }
+            .auth-card {
+                margin: 1rem auto;
+                border: none;
+                box-shadow: none;
+            }
+            .ai-synthesis-card, .auth-body, .static-content-container,
+            .profile-header-card, .article-body, .article-full-content-wrapper {
+                padding: 1.5rem;
+            }
+            .article-full-content-wrapper {
+                padding: 1.5rem 1rem;
+            }
+            .synthesis-text {
+                font-size: 1.05rem;
+            }
         }
-        .auth-container { max-width: 450px; margin: 3rem auto; padding: 2rem; }
-        .auth-title { text-align: center; color: var(--primary-color); margin-bottom: 1.5rem; font-weight: 700;}
-        body.dark-mode .auth-title { color: var(--secondary-color); }
-        .comment-section { margin-top: 3rem; }
-        .comment-container { margin-bottom: 1.5rem; }
-        .comment-card { display: flex; gap: 1rem; }
-        .comment-avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--primary-light); color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; flex-shrink: 0; }
-        body.dark-mode .comment-avatar { background: var(--primary-color); }
-        .comment-body { flex-grow: 1; border-bottom: 1px solid var(--card-border-color); padding-bottom: 1rem; }
-        .comment-container:last-child > .comment-card > .comment-body { border-bottom: none; }
-        .comment-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem; }
-        .comment-author { font-weight: 600; color: var(--primary-color); }
-        body.dark-mode .comment-author { color: var(--secondary-light); }
-        .comment-date { font-size: 0.8rem; color: var(--text-muted-color); }
-        .comment-content { font-size: 0.95rem; color: var(--text-color); margin-bottom: 0.5rem; white-space: pre-wrap; }
-        .comment-actions { display: flex; align-items: center; gap: 0.75rem; font-size: 0.85rem; }
-        .comment-actions button { background: none; border: none; padding: 0.2rem 0.4rem; color: var(--text-muted-color); cursor: pointer; display: flex; align-items: center; gap: 0.3rem; transition: color 0.2s ease, background-color 0.2s ease; border-radius: 4px; }
-        .comment-actions button:hover { color: var(--primary-color); background-color: rgba(var(--primary-color-rgb), 0.1); }
-        body.dark-mode .comment-actions button:hover { color: var(--secondary-light); background-color: rgba(var(--secondary-color-rgb),0.2); }
-        .comment-actions button.active { color: var(--primary-color); font-weight: 600; }
-        body.dark-mode .comment-actions button.active { color: var(--secondary-color); }
-        .comment-actions .vote-btn.active .fa-thumbs-up { color: var(--primary-color); }
-        .comment-actions .vote-btn.active .fa-thumbs-down { color: var(--accent-color); }
-        body.dark-mode .comment-actions .vote-btn.active .fa-thumbs-up { color: var(--secondary-color); }
-        body.dark-mode .comment-actions .vote-btn.active .fa-thumbs-down { color: var(--accent-color); }
-        .comment-actions .vote-count { font-weight: 500; min-width: 12px; text-align: center;}
-        .comment-replies { margin-left: 30px; padding-left: 1.25rem; border-left: 2px solid var(--card-border-color); margin-top: 1rem; }
-        .reply-form-container { display: none; margin-top: 0.75rem; padding: 0.75rem; background-color: rgba(var(--primary-color-rgb), 0.03); border-radius: 6px;}
-        body.dark-mode .reply-form-container { background-color: rgba(var(--secondary-color-rgb), 0.05); }
-        .add-comment-form textarea { min-height: 100px; }
-        .profile-card { padding: 2rem; margin-bottom: 2rem; }
-        .profile-card .profile-avatar { width: 100px; height: 100px; border-radius: 50%; background-color: var(--primary-color); color: white; display: flex; align-items: center; justify-content: center; font-size: 2.5rem; margin: 0 auto 1rem; }
-        body.dark-mode .profile-card .profile-avatar { background-color: var(--secondary-color); }
-        .profile-card h2 { text-align: center; }
-        .profile-card p { text-align: center; margin-bottom: 0.5rem; }
-        .profile-tabs .nav-link { color: var(--primary-color); font-weight: 500; }
-        .profile-tabs .nav-link.active { color: var(--secondary-color); border-bottom: 2px solid var(--secondary-color); background: transparent; }
-        body.dark-mode .profile-tabs .nav-link { color: var(--text-muted-color); }
-        body.dark-mode .profile-tabs .nav-link.active { color: var(--secondary-light); border-bottom-color: var(--secondary-light); }
-        .bookmark-btn { background: none; border: none; font-size: 1.5rem; color: var(--text-muted-color); cursor: pointer; padding: 0.25rem 0.5rem; transition: color 0.2s ease; vertical-align: middle; }
-        .bookmark-btn.active { color: var(--bookmark-active-color); }
-        .bookmark-btn:hover { color: var(--primary-color); }
-        body.dark-mode .bookmark-btn:hover { color: var(--secondary-light); }
-        .article-card .bookmark-btn { font-size: 1.2rem; padding: 0.1rem 0.3rem; }
     </style>
-    {% block head_extra %}{% endblock %}    
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-6975904325280886"
-     crossorigin="anonymous"></script>
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-CV5LWJ7NQ7"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-
-  gtag('config', 'G-CV5LWJ7NQ7');
-</script>
-     
+    {% block head_extra %}{% endblock %}
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-6975904325280886" crossorigin="anonymous"></script>
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-CV5LWJ7NQ7"></script>
+    <script>
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-CV5LWJ7NQ7');
+    </script>
 </head>
-<body class="{{ request.cookies.get('darkMode', 'disabled') }}">
+<body class="{{ request.cookies.get('darkMode', 'disabled') }}{% block body_class %}{% endblock %}">
+    
+    <header>
+        <nav class="navbar-main">
+            <div class="container">
+                <div class="navbar-content-wrapper">
+                    <div class="navbar-left">
+                        <a class="navbar-brand-custom" href="{{ url_for('index') }}">
+                            <i class="fas fa-bolt-lightning brand-icon"></i>
+                            <span>Briefly</span>
+                        </a>
+                    </div>
+                    <div class="navbar-center">
+                        <form action="{{ url_for('search_results') }}" method="GET" class="search-container">
+                            <input type="search" name="query" class="form-control navbar-search" placeholder="Search news articles..." value="{{ request.args.get('query', '') }}">
+                            <i class="fas fa-search search-icon"></i>
+                        </form>
+                    </div>
+                    <div class="navbar-right">
+                        <div class="header-controls">
+                            <button class="header-btn" type="button" data-bs-toggle="offcanvas" data-bs-target="#mainOffcanvas" aria-controls="mainOffcanvas">
+                                <i class="fas fa-bars"></i>
+                                <span class="d-none d-sm-inline ms-1">Menu</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </nav>
+    </header>
+
+    <div class="offcanvas offcanvas-end" tabindex="-1" id="mainOffcanvas" aria-labelledby="mainOffcanvasLabel">
+        <div class="offcanvas-header">
+            <h5 class="offcanvas-title" id="mainOffcanvasLabel">Briefly Menu</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+        </div>
+        <div class="offcanvas-body d-flex flex-column">
+
+            <div class="sidebar-section">
+                {% if session.user_id %}
+                    <div class="dropdown">
+                        <a href="#" class="sidebar-btn dropdown-toggle" id="offcanvasUserDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                            <div class="sidebar-avatar">{{ session.user_name[0]|upper }}</div>
+                            <strong class="ms-3">{{ session.user_name|truncate(20) }}</strong>
+                        </a>
+                        <ul class="dropdown-menu shadow" aria-labelledby="offcanvasUserDropdown">
+                            <li><a class="dropdown-item" href="{{ url_for('profile') }}"><i class="fas fa-id-card fa-fw me-2"></i>Profile</a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item" href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt fa-fw me-2"></i>Logout</a></li>
+                        </ul>
+                    </div>
+                {% else %}
+                    <a href="{{ url_for('login') }}" class="sidebar-btn">
+                        <i class="fas fa-sign-in-alt fa-fw me-2"></i> Login / Register
+                    </a>
+                {% endif %}
+            </div>
+
+            <div class="sidebar-section">
+                 <button class="sidebar-btn dark-mode-toggle w-100">
+                    <i class="fas fa-moon fa-fw me-2"></i> <span class="theme-text">Dark Mode</span>
+                 </button>
+            </div>
+            
+            <hr class="my-2">
+
+            <div class="sidebar-section flex-grow-1">
+                <h6 class="sidebar-heading">Categories</h6>
+                <ul class="nav nav-pills flex-column mb-auto">
+                    {% for cat_item in categories %}
+                        {% set cat_url_params = {'category_name': cat_item, 'page': 1} %}
+                        {% if cat_item == 'All Articles' and selected_category == 'All Articles' and request.args.get('filter_date') %}
+                            {% set _ = cat_url_params.update({'filter_date': request.args.get('filter_date')}) %}
+                        {% endif %}
+                        <li class="nav-item">
+                            <a href="{{ url_for('index', **cat_url_params) }}" class="nav-link {% if selected_category == cat_item %}active{% endif %}">
+                                <i class="fas fa-fw fa-{% if cat_item == 'All Articles' %}globe-americas{% elif cat_item == 'Popular Stories' %}fire-alt{% elif cat_item == "Yesterday's Headlines" %}history{% elif cat_item == 'Community Hub' %}users{% endif %} me-2"></i>
+                                {{ cat_item }}
+                            </a>
+                        </li>
+                    {% endfor %}
+                </ul>
+            </div>
+            
+            <hr class="my-2">
+
+            <div class="sidebar-section">
+                <h6 class="sidebar-heading">Filter by Date</h6>
+                <form id="dateFilterForm" class="mt-2">
+                    <label for="articleDateFilter" class="visually-hidden">Filter articles by date</label>
+                    <div class="input-group">
+                        <input type="date" id="articleDateFilter" class="form-control" title="Filter 'All Articles' by date" value="{{ current_filter_date | default('', true) }}">
+                        <button class="btn btn-primary" type="submit" title="Apply Date Filter">Go</button>
+                    </div>
+                     {% if current_filter_date %}
+                        <button class="btn btn-sm btn-outline-danger mt-2 w-100" type="button" id="clearDateFilter">Clear Date Filter</button>
+                    {% endif %}
+                </form>
+            </div>
+        </div>
+    </div>
+
     <div id="alert-placeholder">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
@@ -1281,212 +1915,141 @@ BASE_HTML_TEMPLATE = """
         {% endwith %}
     </div>
 
-    <nav class="navbar navbar-main navbar-expand-lg fixed-top">
-        <div class="container">
-            <div class="navbar-content-wrapper">
-                <a class="navbar-brand-custom animate-fade-in" href="{{ url_for('index') }}">
-                    <i class="fas fa-bolt-lightning brand-icon"></i>
-                    <span>BrieflyAI</span>
-                </a>
-                <div class="search-form-container">
-                    <form action="{{ url_for('search_results') }}" method="GET" class="search-container animate-fade-in fade-in-delay-1">
-                        <input type="search" name="query" class="form-control navbar-search" placeholder="Search news articles..." value="{{ request.args.get('query', '') }}">
-                        <i class="fas fa-search search-icon"></i>
-                        <button type="submit" class="d-none">Search</button>
-                    </form>
-                </div>
-                <div class="header-controls animate-fade-in fade-in-delay-2">
-                    <button class="header-btn dark-mode-toggle" aria-label="Toggle dark mode" title="Toggle Dark Mode">
-                        <i class="fas fa-moon"></i>
-                    </button>
-                    {% if session.user_id %}
-                    <div class="dropdown">
-                        <button class="header-btn dropdown-toggle" type="button" id="userDropdown" data-bs-toggle="dropdown" aria-expanded="false" title="User Menu">
-                            <i class="fas fa-user-circle"></i> <span class="d-none d-md-inline">Hi, {{ session.user_name|truncate(15) }}!</span>
-                        </button>
-                        <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
-                            <li><a class="dropdown-item" href="{{ url_for('profile') }}"><i class="fas fa-id-card me-2"></i>Profile</a></li>
-                            <li><hr class="dropdown-divider"></li>
-                            <li><a class="dropdown-item" href="{{ url_for('logout') }}"><i class="fas fa-sign-out-alt me-2"></i>Logout</a></li>
-                        </ul>
-                    </div>
-                    {% else %}
-                    <a href="{{ url_for('login') }}" class="header-btn" title="Login/Register">
-                        <i class="fas fa-user"></i> <span class="d-none d-sm-inline">Login</span>
-                    </a>
-                    {% endif %}
-                </div>
-            </div>
-        </div>
-    </nav>
-
-    <nav class="navbar navbar-expand-lg category-nav">
-        <div class="container">
-            <div class="categories-wrapper">
-                <div class="category-links-container">
-                {% for cat_item in categories %}
-                    {% set cat_url_params = {'category_name': cat_item, 'page': 1} %}
-                    {% if cat_item == 'All Articles' and selected_category == 'All Articles' and request.args.get('filter_date') %}
-                        {% set _ = cat_url_params.update({'filter_date': request.args.get('filter_date')}) %}
-                    {% endif %}
-                    <a href="{{ url_for('index', **cat_url_params) }}" class="category-link {% if selected_category == cat_item %}active{% endif %}">
-                        <i class="fas fa-{% if cat_item == 'All Articles' %}globe-americas{% elif cat_item == 'Community Hub' %}users{% endif %} me-1 d-none d-sm-inline"></i>
-                        {{ cat_item }}
-                    </a>
-                {% endfor %}
-                </div>
-                
-                <form id="dateFilterForm" class="ms-2 ms-md-3" style="min-width: 180px;"> {# Adjusted min-width for "Go" button #}
-                    <label for="articleDateFilter" class="visually-hidden">Filter articles by date</label>
-                    <div class="input-group input-group-sm">
-                        <input type="date" id="articleDateFilter" class="form-control form-control-sm" 
-                               value="{{ current_filter_date | default('', true) }}" 
-                               aria-label="Filter by date for All Articles"
-                               title="Filter 'All Articles' by date">
-                        <button class="btn btn-outline-secondary btn-sm" type="submit" title="Apply Date Filter" style="padding-left: 0.5rem; padding-right: 0.5rem;">Go</button> {# Changed icon to "Go" text #}
-                        {% if current_filter_date %}
-                        <button class="btn btn-outline-danger btn-sm" type="button" id="clearDateFilter" title="Clear Date Filter"><i class="fas fa-times"></i></button>
-                        {% endif %}
-                    </div>
-                </form>
-            </div>
-        </div>
-    </nav>
-
     <main class="container main-content my-4">
         {% block content %}{% endblock %}
     </main>
-
+    
     {% if session.user_id %}
     <div class="admin-controls">
-        <button class="add-article-btn" id="addArticleBtn" title="Post a New Article">
-            <i class="fas fa-plus"></i>
+        <button class="add-article-btn" data-bs-toggle="modal" data-bs-target="#addArticleModal" title="Post a New Article">
+            <i class="fas fa-pen-to-square"></i>
         </button>
     </div>
-    <div class="add-article-modal" id="addArticleModal">
-        <div class="modal-content">
-            <button class="close-modal" id="closeModalBtn" title="Close Modal"><i class="fas fa-times"></i></button>
-            <h3 class="modal-title">Post New Article to Community Hub</h3>
-            <form id="addArticleForm" action="{{ url_for('post_article') }}" method="POST">
-                <div class="modal-form-group"><label for="articleTitle">Article Title</label><input type="text" id="articleTitle" name="title" class="modal-form-control" placeholder="Enter article title" required></div>
-                <div class="modal-form-group"><label for="articleDescription">Short Description / Summary</label><textarea id="articleDescription" name="description" class="modal-form-control" rows="3" placeholder="Brief summary of the article" required></textarea></div>
-                <div class="modal-form-group"><label for="articleSource">Source Name (e.g., Your Blog, Personal Research)</label><input type="text" id="articleSource" name="sourceName" class="modal-form-control" placeholder="Source of this article" value="Community Post" required></div>
-                <div class="modal-form-group"><label for="articleImage">Featured Image URL (Optional)</label><input type="url" id="articleImage" name="imageUrl" class="modal-form-control" placeholder="https://example.com/image.jpg"></div>
-                <div class="modal-form-group"><label for="articleContent">Full Article Content</label><textarea id="articleContent" name="content" class="modal-form-control" rows="7" placeholder="Write the full article content here..." required></textarea></div>
-                <div class="d-flex justify-content-end gap-2"><button type="button" class="btn btn-outline-secondary-modal" id="cancelArticleBtn">Cancel</button><button type="submit" class="btn btn-primary-modal">Post Article</button></div>
-            </form>
+    <div class="modal fade" id="addArticleModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content p-4">
+                <div class="modal-header border-0 pb-0">
+                    <h4 class="modal-title">Post New Article</h4>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="addArticleForm" action="{{ url_for('post_article') }}" method="POST">
+                        <div class="mb-3"><label for="articleTitle" class="form-label">Article Title</label><input type="text" id="articleTitle" name="title" class="form-control" required></div>
+                        <div class="mb-3"><label for="articleDescription" class="form-label">Short Description</label><textarea id="articleDescription" name="description" class="form-control" rows="3" required></textarea></div>
+                        <div class="mb-3"><label for="articleSource" class="form-label">Source Name</label><input type="text" id="articleSource" name="sourceName" class="form-control" value="Community Post" required></div>
+                        <div class="mb-3"><label for="articleImage" class="form-label">Image URL (Optional)</label><input type="url" id="articleImage" name="imageUrl" class="form-control"></div>
+                        <div class="mb-3"><label for="articleContent" class="form-label">Full Article Content</label><textarea id="articleContent" name="content" class="form-control" rows="7" required></textarea></div>
+                        <div class="d-flex justify-content-end gap-2 mt-4"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary">Post Article</button></div>
+                    </form>
+                </div>
+            </div>
         </div>
     </div>
     {% endif %}
 
     <footer class="mt-auto">
         <div class="container">
-            <div class="footer-content">
-                <div class="footer-section">
+            <div class="footer-content row">
+                <div class="footer-section col-lg-4 col-md-6 mb-4">
                     <div class="d-flex align-items-center mb-2">
-                        <i class="fas fa-bolt-lightning footer-brand-icon me-2"></i>
-                        <span class="h5 mb-0 footer-brand-text">BrieflyAI</span>
+                        <i class="fas fa-bolt-lightning me-2" style="color:var(--secondary-light); font-size: 1.5rem;"></i>
+                        <span class="h5 mb-0" style="color:white; font-family: 'Poppins', sans-serif;">Briefly</span>
                     </div>
-                    <p class="small">Your premier source for AI summarized, India-centric news.</p>
+                    <p class="small text-light">Your premier source for AI summarized, India-centric news.</p>
                     <div class="social-links">
                         <a href="#" title="Twitter"><i class="fab fa-twitter"></i></a><a href="#" title="Facebook"><i class="fab fa-facebook-f"></i></a><a href="#" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a><a href="#" title="Instagram"><i class="fab fa-instagram"></i></a>
                     </div>
                 </div>
-                <div class="footer-section">
+                <div class="footer-section col-lg-2 col-md-6 mb-4">
                     <h5>Quick Links</h5>
                     <div class="footer-links">
-                        <a href="{{ url_for('index') }}"><i class="fas fa-angle-right"></i> Home</a>
-                        <a href="{{ url_for('about') }}"><i class="fas fa-angle-right"></i> About Us</a>
-                        <a href="{{ url_for('contact') }}"><i class="fas fa-angle-right"></i> Contact</a>
-                        <a href="{{ url_for('privacy') }}"><i class="fas fa-angle-right"></i> Privacy Policy</a>
-                        {% if session.user_id %}
-                        <a href="{{ url_for('profile') }}"><i class="fas fa-angle-right"></i> My Profile</a>
-                        {% endif %}
+                        <a href="{{ url_for('index') }}">Home</a>
+                        <a href="{{ url_for('about') }}">About Us</a>
+                        <a href="{{ url_for('contact') }}">Contact</a>
+                        <a href="{{ url_for('privacy') }}">Privacy Policy</a>
+                        {% if session.user_id %}<a href="{{ url_for('profile') }}">My Profile</a>{% endif %}
                     </div>
                 </div>
-                <div class="footer-section">
+                <div class="footer-section col-lg-2 col-md-6 mb-4">
                     <h5>Categories</h5>
                     <div class="footer-links">
-                        {% for cat_item in categories %}<a href="{{ url_for('index', category_name=cat_item, page=1) }}"><i class="fas fa-angle-right"></i> {{ cat_item }}</a>{% endfor %}
+                        {% for cat_item in categories %}<a href="{{ url_for('index', category_name=cat_item, page=1) }}">{{ cat_item }}</a>{% endfor %}
                     </div>
                 </div>
-                <div class="footer-section">
+                <div class="footer-section col-lg-4 col-md-6 mb-4">
                     <h5>Newsletter</h5>
-                    <p class="small">Subscribe for weekly updates on the latest news!</p>
-                    <form action="{{ url_for('subscribe') }}" method="POST" class="mt-2">
+                    <p class="small text-light">Subscribe for weekly updates!</p>
+                    <form action="{{ url_for('subscribe') }}" method="POST" class="mt-3">
                         <div class="input-group">
-                            <input type="email" name="email" class="form-control form-control-sm" placeholder="Your Email" aria-label="Your Email" required>
-                            <button class="btn btn-sm btn-primary-modal" type="submit">Subscribe</button>
+                            <input type="email" name="email" class="form-control form-control-sm" placeholder="Your Email" aria-label="Your Email" required style="background: #374151; border-color: #4B5563; color: white;">
+                            <button class="btn btn-sm btn-primary" type="submit">Subscribe</button>
                         </div>
                     </form>
                 </div>
             </div>
-            <div class="copyright">&copy; {{ current_year }} BrieflyAI. All rights reserved. Made with <i class="fas fa-heart text-danger"></i> in India.</div>
+            <div class="copyright">&copy; 2025 Briefly. All rights reserved. Made with <i class="fas fa-heart text-danger"></i> in India.</div>
         </div>
     </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
     document.addEventListener('DOMContentLoaded', function () {
-        const darkModeToggle = document.querySelector('.dark-mode-toggle');
-        const body = document.body;
-        function updateThemeIcon() { if(darkModeToggle) { darkModeToggle.innerHTML = body.classList.contains('dark-mode') ? '<i class="fas fa-sun"></i>' : '<i class="fas fa-moon"></i>'; } }
-        function applyTheme(theme) {
-            if (theme === 'enabled') { body.classList.add('dark-mode'); } else { body.classList.remove('dark-mode'); }
-            updateThemeIcon();
-            localStorage.setItem('darkMode', theme);
-            document.cookie = "darkMode=" + theme + ";path=/;max-age=" + (60*60*24*365) + ";SameSite=Lax";
-        }
-        if(darkModeToggle) { darkModeToggle.addEventListener('click', () => { applyTheme(body.classList.contains('dark-mode') ? 'disabled' : 'enabled'); }); }
-        let storedTheme = localStorage.getItem('darkMode');
-        if (!storedTheme) { const cookieTheme = document.cookie.split('; ').find(row => row.startsWith('darkMode='))?.split('=')[1]; if (cookieTheme) storedTheme = cookieTheme; }
-        if (storedTheme) { applyTheme(storedTheme); } else { updateThemeIcon(); }
-        
-        const addArticleBtn = document.getElementById('addArticleBtn');
-        const addArticleModal = document.getElementById('addArticleModal');
-        const closeModalBtn = document.getElementById('closeModalBtn');
-        const cancelArticleBtn = document.getElementById('cancelArticleBtn');
-        if(addArticleBtn && addArticleModal) {
-            addArticleBtn.addEventListener('click', () => { addArticleModal.style.display = 'flex'; body.style.overflow = 'hidden'; });
-            const closeModalFunction = () => { addArticleModal.style.display = 'none'; body.style.overflow = 'auto'; if(document.getElementById('addArticleForm')) document.getElementById('addArticleForm').reset(); };
-            if(closeModalBtn) closeModalBtn.addEventListener('click', closeModalFunction);
-            if(cancelArticleBtn) cancelArticleBtn.addEventListener('click', closeModalFunction);
-            addArticleModal.addEventListener('click', (e) => { if (e.target === addArticleModal) closeModalFunction(); });
-        }
-        
-        const flashedAlerts = document.querySelectorAll('#alert-placeholder .alert');
-        flashedAlerts.forEach(function(alert) { setTimeout(function() { const bsAlert = bootstrap.Alert.getOrCreateInstance(alert); if (bsAlert) bsAlert.close(); }, 7000); });
+        try {
+            const darkModeToggle = document.querySelector('.dark-mode-toggle');
+            if (darkModeToggle) {
+                const body = document.body;
+                const updateThemeUI = () => {
+                    const isDarkMode = body.classList.contains('dark-mode');
+                    const themeIcon = darkModeToggle.querySelector('i');
+                    const themeText = darkModeToggle.querySelector('.theme-text');
+                    if (themeIcon) {
+                        themeIcon.className = isDarkMode ? 'fas fa-sun fa-fw me-2' : 'fas fa-moon fa-fw me-2';
+                    }
+                    if (themeText) {
+                        themeText.textContent = isDarkMode ? 'Light Mode' : 'Dark Mode';
+                    }
+                };
+                const applyTheme = (theme) => {
+                    body.classList.toggle('dark-mode', theme === 'enabled');
+                    localStorage.setItem('darkMode', theme);
+                    document.cookie = "darkMode=" + theme + ";path=/;max-age=31536000;SameSite=Lax";
+                    updateThemeUI();
+                };
+                darkModeToggle.addEventListener('click', () => {
+                    const isEnabled = body.classList.contains('dark-mode');
+                    applyTheme(isEnabled ? 'disabled' : 'enabled');
+                });
+                updateThemeUI();
+            }
 
-        const dateFilterForm = document.getElementById('dateFilterForm');
-        if (dateFilterForm) {
-            dateFilterForm.addEventListener('submit', function(event) {
-                event.preventDefault();
-                const dateInput = document.getElementById('articleDateFilter');
-                const selectedDate = dateInput.value;
-                let baseUrl = "{{ url_for('index', category_name='All Articles', page=1) }}";
-                let targetUrl = new URL(baseUrl, window.location.origin);
-
-                if (selectedDate) {
-                    targetUrl.searchParams.set('filter_date', selectedDate);
-                } else {
-                    // If date is cleared, we want to go to All Articles without filter_date
-                    targetUrl.searchParams.delete('filter_date');
-                }
-                targetUrl.searchParams.delete('page'); // Always reset to page 1 on new filter/clear
-                window.location.href = targetUrl.toString();
+            const flashedAlerts = document.querySelectorAll('#alert-placeholder .alert');
+            flashedAlerts.forEach(function(alert) { 
+                setTimeout(function() {
+                    const bsAlert = bootstrap.Alert.getOrCreateInstance(alert);
+                    if (bsAlert) bsAlert.close();
+                }, 7000);
             });
 
-            const clearDateFilterBtn = document.getElementById('clearDateFilter');
-            if (clearDateFilterBtn) {
-                clearDateFilterBtn.addEventListener('click', function() {
-                    document.getElementById('articleDateFilter').value = '';
-                    let baseUrl = "{{ url_for('index', category_name='All Articles', page=1) }}";
-                    let targetUrl = new URL(baseUrl, window.location.origin);
-                    targetUrl.searchParams.delete('filter_date');
-                    targetUrl.searchParams.delete('page'); // Always reset to page 1
-                    window.location.href = targetUrl.toString();
+            const dateFilterForm = document.getElementById('dateFilterForm');
+            if (dateFilterForm) {
+                dateFilterForm.addEventListener('submit', function(event) {
+                    event.preventDefault();
+                    const dateInput = document.getElementById('articleDateFilter');
+                    if (dateInput && dateInput.value) {
+                       let targetUrl = new URL("{{ url_for('index', category_name='All Articles') }}", window.location.origin);
+                       targetUrl.searchParams.set('filter_date', dateInput.value);
+                       window.location.href = targetUrl.toString();
+                    }
                 });
+                const clearDateFilterBtn = document.getElementById('clearDateFilter');
+                if (clearDateFilterBtn) {
+                    clearDateFilterBtn.addEventListener('click', function() {
+                        window.location.href = "{{ url_for('index', category_name='All Articles') }}";
+                    });
+                }
             }
+        } catch (e) {
+            console.error("An error occurred in the base layout script:", e);
         }
     });
     </script>
@@ -1499,140 +2062,203 @@ INDEX_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
 {% block title %}
     {% if query %}Search: {{ query|truncate(30) }}
-    {% elif selected_category == 'All Articles' and current_filter_date %}Articles for {{ current_filter_date }}
-    {% elif selected_category %}{{selected_category}}
-    {% else %}Home{% endif %} - BrieflyAI (India News)
+    {% elif selected_category == 'All Articles' and is_main_homepage == False %}All Articles
+    {% elif selected_category and not is_main_homepage %}{{ selected_category }}
+    {% else %}Popular & Latest News from India{% endif %} - BrieflyAI
 {% endblock %}
 
 {% block content %}
-    {% if selected_category == 'All Articles' and current_filter_date %}
-        <h4 class="mb-3 fst-italic">Showing articles for: {{ current_filter_date }}</h4>
-    {% endif %}
 
-    {% if articles and articles[0] and featured_article_on_this_page %}
-    {# ... (featured article section remains unchanged from your original file) ... #}
-    <article class="featured-article p-md-4 p-3 mb-4 animate-fade-in">
-        <div class="row g-0 g-md-4">
-            {% set art0 = articles[0] %}
-            {% set article_url = url_for('article_detail', article_hash_id=(art0.article_hash_id if art0.is_community_article else art0.id)) %}
-            <div class="col-lg-6">
-                <div class="featured-image rounded overflow-hidden shadow-sm" style="height:320px;">
-                    <a href="{{ article_url }}">
-                    <img src="{{ art0.image_url if art0.is_community_article else art0.urlToImage }}" class="img-fluid w-100 h-100" style="object-fit:cover;" alt="Featured: {{ art0.title|truncate(50) }}">
-                    </a>
-                </div>
+{# This is the main controller: It shows the full homepage, or the list view for categories. #}
+{% if is_main_homepage %}
+
+    {# ============== LAYOUT 1: MAIN HOMEPAGE (WITH ALL FEATURES) ============== #}
+    <div class="animate-fade-in">
+        
+        {% if synthesis %}
+        <div class="ai-synthesis-card">
+            <div class="synthesis-header">
+                <i class="fas fa-brain"></i>
+                <h2>Today's Briefing: The Big Picture</h2>
             </div>
-            <div class="col-lg-6 d-flex flex-column ps-lg-3 pt-3 pt-lg-0">
-                <div class="d-flex justify-content-between align-items-start">
-                    <div> {# Container for meta items except bookmark #}
-                        <div class="article-meta mb-2">
-                            <span class="badge bg-primary me-2" style="font-size:0.75rem;">{{ (art0.author.name if art0.is_community_article and art0.author else art0.source.name)|truncate(25) }}</span>
-                            <span class="meta-item"><i class="far fa-calendar-alt"></i> {{ (art0.published_at | to_ist if art0.is_community_article else (art0.publishedAt | to_ist if art0.publishedAt else 'N/A')) }}</span>
-                        </div>
-                    </div>
-                    {% if session.user_id %}
-                    <button class="bookmark-btn homepage-bookmark-btn {% if art0.is_bookmarked %}active{% endif %}"
-                            title="{% if art0.is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}"
-                            data-article-hash-id="{{ art0.article_hash_id if art0.is_community_article else art0.id }}"
-                            data-is-community="{{ 'true' if art0.is_community_article else 'false' }}"
-                            data-title="{{ art0.title|e }}"
-                            data-source-name="{{ (art0.author.name if art0.is_community_article and art0.author else art0.source.name)|e }}"
-                            data-image-url="{{ (art0.image_url if art0.is_community_article else art0.urlToImage)|e }}"
-                            data-description="{{ (art0.description if art0.description else '')|e }}"
-                            data-published-at="{{ (art0.published_at.isoformat() if art0.is_community_article and art0.published_at else (art0.publishedAt if not art0.is_community_article and art0.publishedAt else ''))|e }}">
-                        <i class="fa-solid fa-bookmark"></i>
-                    </button>
-                    {% endif %}
-                </div>
-                <h2 class="mb-2 h4"><a href="{{ article_url }}" class="text-decoration-none article-title">{{ art0.title }}</a></h2>
-                <p class="article-description flex-grow-1 small">{{ art0.description|truncate(220) }}</p>
-                <a href="{{ article_url }}" class="read-more mt-auto align-self-start py-2 px-3" style="width:auto;">Read Full Article <i class="fas fa-arrow-right ms-1 small"></i></a>
+            <p class="synthesis-text">"{{ synthesis }}"</p>
+            {% if keywords %}
+            <div class="synthesis-keywords">
+                {% for keyword in keywords %}
+                    <a href="{{ url_for('search_results', query=keyword) }}" class="keyword-tag">{{ keyword }}</a>
+                {% endfor %}
             </div>
+            {% endif %}
         </div>
-    </article>
-    {% elif not articles and selected_category == 'All Articles' and current_filter_date %}
-        <div class="alert alert-info text-center my-4 p-3 small">No articles found for <strong>{{ current_filter_date }}</strong>. Please try a different date or clear the date filter.</div>
-    {% elif not articles and selected_category != 'Community Hub' and not query %}
-        <div class="alert alert-warning text-center my-4 p-3 small">No recent Indian news found. Please check back later.</div>
-    {% elif not articles and selected_category == 'Community Hub' %}
-        <div class="alert alert-info text-center my-4 p-3"><h4><i class="fas fa-feather-alt me-2"></i>No Articles Penned Yet</h4><p>No articles in the Community Hub. {% if session.user_id %}Click the '+' button to share your insights!{% else %}Login to add articles.{% endif %}</p></div>
-    {% elif not articles and query %}
-        <div class="alert alert-info text-center my-5 p-4"><h4><i class="fas fa-search me-2"></i>No results for "{{ query }}"</h4><p>Try different keywords or browse categories.</p></div>
-    {% endif %}
+        {% endif %}
 
-    <div class="row g-4">
-        {% set articles_to_display = (articles[1:] if featured_article_on_this_page and articles else articles) %}
-        {% for art in articles_to_display %}
-        <div class="col-md-6 col-lg-4 d-flex">
-        <article class="article-card animate-fade-in d-flex flex-column w-100" style="animation-delay: {{ loop.index0 * 0.05 }}s">
-            {% set article_url = url_for('article_detail', article_hash_id=(art.article_hash_id if art.is_community_article else art.id)) %}
-            <div class="article-image-container">
-                <a href="{{ article_url }}">
-                <img src="{{ art.image_url if art.is_community_article else art.urlToImage }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a>
-            </div>
-            <div class="article-body d-flex flex-column">
-                <div class="d-flex justify-content-between align-items-start">
-                    <h5 class="article-title mb-2 flex-grow-1"><a href="{{ article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
-                    {% if session.user_id %}
-                    <button class="bookmark-btn homepage-bookmark-btn {% if art.is_bookmarked %}active{% endif %}" style="margin-left: 10px; padding-top:0;"
-                            title="{% if art.is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}"
-                            data-article-hash-id="{{ art.article_hash_id if art.is_community_article else art.id }}"
-                            data-is-community="{{ 'true' if art.is_community_article else 'false' }}"
-                            data-title="{{ art.title|e }}"
-                            data-source-name="{{ (art.author.name if art.is_community_article and art.author else art.source.name)|e }}"
-                            data-image-url="{{ (art.image_url if art.is_community_article else art.urlToImage)|e }}"
-                            data-description="{{ (art.description if art.description else '')|e }}"
-                            data-published-at="{{ (art.published_at.isoformat() if art.is_community_article and art.published_at else (art.publishedAt if not art.is_community_article and art.publishedAt else ''))|e }}">
-                        <i class="fa-solid fa-bookmark"></i>
-                    </button>
-                    {% endif %}
+        {% if featured_article %}
+        <article class="featured-story">
+            <div class="featured-story-image" style="background-image: url('{{ featured_article.urlToImage }}')"></div>
+            <div class="featured-story-content">
+                <div class="article-meta">
+                    <span class="meta-item"><i class="fas fa-fire-alt text-danger"></i> Top Story</span>
+                    <span class="meta-item"><i class="fas fa-building"></i> {{ featured_article.source.name|truncate(20) }}</span>
                 </div>
-                <div class="article-meta small mb-2">
-                    <span class="meta-item text-muted"><i class="fas fa-{{ 'user-edit' if art.is_community_article else 'building' }}"></i> {{ (art.author.name if art.is_community_article and art.author else art.source.name)|truncate(20) }}</span>
-                    <span class="meta-item text-muted"><i class="far fa-calendar-alt"></i> {{ (art.published_at | to_ist if art.is_community_article else (art.publishedAt | to_ist if art.publishedAt else 'N/A')) }}</span>
-                </div>
-                <p class="article-description small">{{ art.description|truncate(100) }}</p>
-                <a href="{{ article_url }}" class="read-more btn btn-sm mt-auto">Read More <i class="fas fa-chevron-right ms-1 small"></i></a>
+                <h2><a href="{{ url_for('article_detail', article_hash_id=featured_article.id) }}">{{ featured_article.title }}</a></h2>
+                <p class="description">{{ featured_article.description|truncate(150) }}</p>
+                <a href="{{ url_for('article_detail', article_hash_id=featured_article.id) }}" class="read-more-btn">Read Full Story <i class="fas fa-arrow-right ms-1"></i></a>
             </div>
         </article>
+        {% endif %}
+
+        <ul class="nav nav-tabs nav-fill mb-3" id="newsTab" role="tablist" style="font-weight: 600;">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="popular-tab" data-bs-toggle="tab" data-bs-target="#popular-tab-pane" type="button" role="tab" aria-controls="popular-tab-pane" aria-selected="true">
+                    <i class="fas fa-fire-alt me-1"></i> POPULAR STORIES
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="yesterday-tab" data-bs-toggle="tab" data-bs-target="#yesterday-tab-pane" type="button" role="tab" aria-controls="yesterday-tab-pane" aria-selected="false">
+                    <i class="fas fa-history me-1"></i> YESTERDAY'S HEADLINES
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content" id="newsTabContent">
+            <div class="tab-pane fade show active" id="popular-tab-pane" role="tabpanel" aria-labelledby="popular-tab">
+                <div class="row g-4 pt-3">
+                    {% if popular_articles %}
+                        {% for art in popular_articles %}
+                            <div class="col-md-6 col-lg-4 d-flex">
+                                <article class="article-card d-flex flex-column w-100">
+                                    {% set article_url = url_for('article_detail', article_hash_id=art.id) %}
+                                    <div class="article-image-container"><a href="{{ article_url }}"><img src="{{ art.urlToImage }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a></div>
+                                    <div class="article-body d-flex flex-column">
+                                        <div class="d-flex justify-content-between align-items-start">
+                                            <h5 class="article-title mb-2 flex-grow-1"><a href="{{ article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
+                                            {% if session.user_id %}<button class="bookmark-btn homepage-bookmark-btn {% if art.is_bookmarked %}active{% endif %}" style="margin-left: 10px; padding-top:0;" title="Bookmark" data-article-hash-id="{{ art.id }}" data-is-community="false" data-title="{{ art.title|e }}" data-source-name="{{ art.source.name|e }}" data-image-url="{{ art.urlToImage|e }}" data-description="{{ (art.description if art.description else '')|e }}" data-published-at="{{ (art.publishedAt if art.publishedAt else '')|e }}"><i class="fa-solid fa-bookmark"></i></button>{% endif %}
+                                        </div>
+                                        <div class="article-meta small mb-2">
+                                            <span class="meta-item text-muted"><i class="fas fa-building"></i> {{ art.source.name|truncate(20) }}</span>
+                                            <span class="meta-item text-muted"><i class="far fa-calendar-alt"></i> {{ (art.publishedAt | to_ist if art.publishedAt else 'N/A') }}</span>
+                                        </div>
+                                        <p class="article-description small">{{ art.description|truncate(100) }}</p>
+                                        <a href="{{ article_url }}" class="read-more btn btn-sm mt-auto">Read More <i class="fas fa-chevron-right ms-1 small"></i></a>
+                                    </div>
+                                </article>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="col-12"><div class="alert alert-light text-center">More popular stories are currently unavailable.</div></div>
+                    {% endif %}
+                </div>
+                {% if popular_articles %}
+                <div class="text-center mt-4">
+                    <a href="{{ url_for('index', category_name='Popular Stories') }}" class="btn btn-outline-primary">View All Popular Stories <i class="fas fa-arrow-right ms-1"></i></a>
+                </div>
+                {% endif %}
+            </div>
+            <div class="tab-pane fade" id="yesterday-tab-pane" role="tabpanel" aria-labelledby="yesterday-tab">
+                <div class="row g-4 pt-3">
+                    {% if latest_yesterday_articles %}
+                        {% for art in latest_yesterday_articles %}
+                             <div class="col-md-6 col-lg-4 d-flex">
+                                <article class="article-card d-flex flex-column w-100">
+                                    {% set article_url = url_for('article_detail', article_hash_id=art.id) %}
+                                    <div class="article-image-container"><a href="{{ article_url }}"><img src="{{ art.urlToImage }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a></div>
+                                    <div class="article-body d-flex flex-column">
+                                        <div class="d-flex justify-content-between align-items-start">
+                                            <h5 class="article-title mb-2 flex-grow-1"><a href="{{ article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
+                                            {% if session.user_id %}<button class="bookmark-btn homepage-bookmark-btn {% if art.is_bookmarked %}active{% endif %}" style="margin-left: 10px; padding-top:0;" title="Bookmark" data-article-hash-id="{{ art.id }}" data-is-community="false" data-title="{{ art.title|e }}" data-source-name="{{ art.source.name|e }}" data-image-url="{{ art.urlToImage|e }}" data-description="{{ (art.description if art.description else '')|e }}" data-published-at="{{ (art.publishedAt if art.publishedAt else '')|e }}"><i class="fa-solid fa-bookmark"></i></button>{% endif %}
+                                        </div>
+                                        <div class="article-meta small mb-2">
+                                            <span class="meta-item text-muted"><i class="fas fa-building"></i> {{ art.source.name|truncate(20) }}</span>
+                                            <span class="meta-item text-muted"><i class="far fa-calendar-alt"></i> {{ (art.publishedAt | to_ist if art.publishedAt else 'N/A') }}</span>
+                                        </div>
+                                        <p class="article-description small">{{ art.description|truncate(100) }}</p>
+                                        <a href="{{ article_url }}" class="read-more btn btn-sm mt-auto">Read More <i class="fas fa-chevron-right ms-1 small"></i></a>
+                                    </div>
+                                </article>
+                            </div>
+                        {% endfor %}
+                    {% else %}
+                        <div class="col-12"><div class="alert alert-light text-center">Could not load yesterday's articles.</div></div>
+                    {% endif %}
+                </div>
+                {% if latest_yesterday_articles %}
+                <div class="text-center mt-4">
+                    <a href="{{ url_for('index', category_name="Yesterday's Headlines") }}" class="btn btn-outline-primary">View All of Yesterday's Headlines <i class="fas fa-arrow-right ms-1"></i></a>
+                </div>
+                {% endif %}
+            </div>
         </div>
-        {% endfor %}
     </div>
 
-    {# Pagination - Updated to include filter_date #}
+{% else %}
+
+    {# ============ LAYOUT 2: STANDARD PAGINATED LIST VIEW (RESTORED) ============ #}
+    {# This block handles all other pages like categories, search, and date filters. #}
+
+    {% if selected_category == 'All Articles' and current_filter_date %}
+        <h4 class="mb-3 fst-italic">Showing articles for: {{ current_filter_date }}</h4>
+    {% elif selected_category != 'All Articles' and selected_category != 'Community Hub' %}
+         <h2 class="pb-2 border-bottom mb-4">{{ selected_category }}</h2>
+    {% endif %}
+
+    {% if articles and not is_main_homepage %} {# This section is for the paginated list view only #}
+        <div class="row g-4">
+            {% for art in articles %}
+            <div class="col-md-6 col-lg-4 d-flex">
+                <article class="article-card animate-fade-in d-flex flex-column w-100" style="animation-delay: {{ loop.index0 * 0.05 }}s">
+                    {% set article_url = url_for('article_detail', article_hash_id=(art.article_hash_id if art.is_community_article else art.id)) %}
+                    <div class="article-image-container">
+                        <a href="{{ article_url }}">
+                        <img src="{{ art.image_url if art.is_community_article else art.urlToImage }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a>
+                    </div>
+                    <div class="article-body d-flex flex-column">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <h5 class="article-title mb-2 flex-grow-1"><a href="{{ article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
+                            {% if session.user_id %}
+                            <button class="bookmark-btn homepage-bookmark-btn {% if art.is_bookmarked %}active{% endif %}" style="margin-left: 10px; padding-top:0;"
+                                    title="{% if art.is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}"
+                                    data-article-hash-id="{{ art.article_hash_id if art.is_community_article else art.id }}"
+                                    data-is-community="{{ 'true' if art.is_community_article else 'false' }}"
+                                    data-title="{{ art.title|e }}"
+                                    data-source-name="{{ (art.author.name if art.is_community_article and art.author else art.source.name)|e }}"
+                                    data-image-url="{{ (art.image_url if art.is_community_article else art.urlToImage)|e }}"
+                                    data-description="{{ (art.description if art.description else '')|e }}"
+                                    data-published-at="{{ (art.published_at.isoformat() if art.is_community_article and art.published_at else (art.publishedAt if not art.is_community_article and art.publishedAt else ''))|e }}">
+                                <i class="fa-solid fa-bookmark"></i>
+                            </button>
+                            {% endif %}
+                        </div>
+                        <div class="article-meta small mb-2">
+                            <span class="meta-item text-muted"><i class="fas fa-{{ 'user-edit' if art.is_community_article else 'building' }}"></i> {% if art.is_community_article and art.author %}<a href="{{ url_for('public_profile', username=art.author.username) }}" class="text-muted text-decoration-none">{{ art.author.name|truncate(20) }}</a>{% else %}{{ art.source.name|truncate(20) }}{% endif %}</span>
+                            <span class="meta-item text-muted"><i class="far fa-calendar-alt"></i> {{ (art.published_at | to_ist if art.is_community_article else (art.publishedAt | to_ist if art.publishedAt else 'N/A')) }}</span>
+                        </div>
+                        <p class="article-description small">{{ art.description|truncate(100) }}</p>
+                        <a href="{{ article_url }}" class="read-more btn btn-sm mt-auto">Read More <i class="fas fa-chevron-right ms-1 small"></i></a>
+                    </div>
+                </article>
+            </div>
+            {% endfor %}
+        </div>
+    {% elif not articles %}
+        <div class="alert alert-info text-center my-5 p-4"><h4><i class="fas fa-search me-2"></i>No articles found.</h4><p>Please try a different category or search query.</p></div>
+    {% endif %}
+
     {% if total_pages and total_pages > 1 %}
     <nav aria-label="Page navigation" class="mt-5"><ul class="pagination justify-content-center">
         {% set filter_date_for_url = request.args.get('filter_date') if selected_category == 'All Articles' and request.args.get('filter_date') else None %}
-        
         <li class="page-item page-link-prev-next {% if current_page == 1 %}disabled{% endif %}">
             <a class="page-link" href="{{ url_for(request.endpoint, page=current_page-1, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) if current_page > 1 else '#' }}">&laquo; Prev</a>
         </li>
-        
         {% set page_window = 1 %}{% set show_first = 1 %}{% set show_last = total_pages %}
-        
-        {% if current_page - page_window > show_first %}
-            <li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=1, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">1</a></li>
-            {% if current_page - page_window > show_first + 1 %}<li class="page-item disabled"><span class="page-link">...</span></li>{% endif %}
-        {% endif %}
-        
-        {% for p in range(1, total_pages + 1) %}
-            {% if p == current_page %}
-                <li class="page-item active" aria-current="page"><span class="page-link">{{ p }}</span></li>
-            {% elif p >= current_page - page_window and p <= current_page + page_window %}
-                <li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=p, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">{{ p }}</a></li>
-            {% endif %}
-        {% endfor %}
-        
-        {% if current_page + page_window < show_last %}
-            {% if current_page + page_window < show_last - 1 %}<li class="page-item disabled"><span class="page-link">...</span></li>{% endif %}
-            <li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=total_pages, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">{{ total_pages }}</a></li>
-        {% endif %}
-        
+        {% if current_page - page_window > show_first %}<li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=1, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">1</a></li>{% if current_page - page_window > show_first + 1 %}<li class="page-item disabled"><span class="page-link">...</span></li>{% endif %}{% endif %}
+        {% for p in range(1, total_pages + 1) %}{% if p == current_page %}<li class="page-item active" aria-current="page"><span class="page-link">{{ p }}</span></li>{% elif p >= current_page - page_window and p <= current_page + page_window %}<li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=p, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">{{ p }}</a></li>{% endif %}{% endfor %}
+        {% if current_page + page_window < show_last %}{% if current_page + page_window < show_last - 1 %}<li class="page-item disabled"><span class="page-link">...</span></li>{% endif %}<li class="page-item"><a class="page-link" href="{{ url_for(request.endpoint, page=total_pages, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) }}">{{ total_pages }}</a></li>{% endif %}
         <li class="page-item page-link-prev-next {% if current_page == total_pages %}disabled{% endif %}">
             <a class="page-link" href="{{ url_for(request.endpoint, page=current_page+1, category_name=selected_category if request.endpoint != 'search_results' else None, query=query if request.endpoint == 'search_results' else None, filter_date=filter_date_for_url) if current_page < total_pages else '#' }}">Next &raquo;</a>
         </li>
     </ul></nav>
     {% endif %}
+{% endif %}
 {% endblock %}
 
 {% block scripts_extra %}
@@ -1685,25 +2311,14 @@ ARTICLE_HTML_TEMPLATE = """
 {% block title %}{{ article.title|truncate(50) if article else "Article" }} - BrieflyAI{% endblock %}
 {% block head_extra %}
 <style>
-    .article-full-content-wrapper { background-color: var(--white-bg); padding: 2rem; border-radius: 10px; box-shadow: 0 5px 20px rgba(0,0,0,0.07); margin-bottom: 2rem; margin-top: 1rem; }
-    .article-full-content-wrapper .main-article-image { width: 100%; max-height: 480px; object-fit: cover; border-radius: 8px; margin-bottom: 1.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-    .article-title-main {font-weight: 700; color: var(--primary-color); line-height:1.3; font-family: 'Poppins', sans-serif;} /* For article detail page */
-    .article-header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
-    .article-meta-detailed { font-size: 0.85rem; color: var(--text-muted-color); margin-bottom: 1.5rem; display:flex; flex-wrap:wrap; gap: 0.5rem 1.2rem; align-items:center; border-bottom: 1px solid var(--card-border-color); padding-bottom:1rem; }
-    .article-meta-detailed .meta-item i { color: var(--secondary-color); margin-right: 0.4rem; font-size:0.95rem; }
-    .summary-box { background-color: rgba(var(--primary-color-rgb), 0.04); padding: 1.5rem; border-radius: 8px; margin: 1.5rem 0; border: 1px solid rgba(var(--primary-color-rgb), 0.1); }
-    .summary-box h5 { color: var(--primary-color); font-weight: 600; margin-bottom: 0.75rem; font-size:1.1rem; }
-    .summary-box p {font-size:0.95rem; line-height:1.7; color: var(--text-color);}
-    body.dark-mode .summary-box p { color: var(--text-muted-color); }
-    .takeaways-box { margin: 1.5rem 0; padding: 1.5rem 1.5rem 1.5rem 1.8rem; border-left: 4px solid var(--secondary-color); background-color: rgba(var(--primary-color-rgb), 0.04); border-radius: 0 8px 8px 0;}
-    .takeaways-box h5 { color: var(--primary-color); font-weight: 600; margin-bottom: 0.75rem; font-size:1.1rem; }
-    .takeaways-box ul { padding-left: 1.2rem; margin-bottom:0; color: var(--text-color); }
-    body.dark-mode .takeaways-box ul { color: var(--text-muted-color); }
-    .takeaways-box ul li { margin-bottom: 0.6rem; font-size:0.95rem; line-height:1.6; }
-    .loader-container { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 200px; padding: 2rem; font-size: 1rem; color: var(--text-muted-color); }
+    .article-full-content-wrapper { background-color: var(--card-bg); padding: clamp(1rem, 4vw, 2rem); border-radius: var(--border-radius-lg); box-shadow: var(--shadow-md); margin-bottom: 2rem; margin-top: 1rem; }
+    .article-title-main {font-weight: 700; color: var(--text-color); line-height:1.3; font-family: 'Poppins', sans-serif;}
+    .summary-box, .takeaways-box { background-color: rgba(var(--primary-color-rgb), 0.04); border: 1px solid rgba(var(--primary-color-rgb), 0.1); border-radius: var(--border-radius-md); margin: 1.5rem 0; padding: 1.5rem; }
+    body.dark-mode .summary-box, body.dark-mode .takeaways-box { background-color: #2a30422e; }
+    .takeaways-box { border-left: 4px solid var(--secondary-color); }
+    .loader-container { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 200px; padding: 2rem; color: var(--text-muted-color); }
     .loader { border: 5px solid var(--light-bg); border-top: 5px solid var(--primary-color); border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin-bottom: 1rem; }
-    .content-text { white-space: pre-wrap; line-height: 1.8; font-size: 1.05rem; color: var(--text-color); } 
-    body.dark-mode .content-text { color: var(--text-muted-color); } 
+    .content-text { white-space: pre-wrap; line-height: 1.8; font-size: 1.05rem; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 </style>
 {% endblock %}
@@ -1715,103 +2330,45 @@ ARTICLE_HTML_TEMPLATE = """
     <div class="mb-3 d-flex justify-content-between align-items-center">
         <a href="{{ previous_list_page }}" class="btn btn-sm btn-outline-secondary"><i class="fas fa-arrow-left me-2"></i>Back to List</a>
         {% if session.user_id %}
-        <button id="bookmarkBtn" class="bookmark-btn {% if is_bookmarked %}active{% endif %}" 
-                title="{% if is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}"
-                data-article-hash-id="{{ article.article_hash_id if is_community_article else article.id }}"
-                data-is-community="{{ 'true' if is_community_article else 'false' }}"
-                data-title="{{ article.title|e }}"
-                data-source-name="{{ (article.author.name if is_community_article and article.author else article.source.name)|e }}"
-                data-image-url="{{ (article.image_url if is_community_article else article.urlToImage)|e }}"
-                data-description="{{ (article.description if article.description else '')|e }}"
-                data-published-at="{{ (article.published_at.isoformat() if is_community_article and article.published_at else (article.publishedAt if not is_community_article and article.publishedAt else ''))|e }}">
-            <i class="fa-solid fa-bookmark"></i>
-        </button>
+        <button id="bookmarkBtn" class="bookmark-btn {% if is_bookmarked %}active{% endif %}" title="{% if is_bookmarked %}Remove Bookmark{% else %}Add Bookmark{% endif %}" data-article-hash-id="{{ article.article_hash_id if is_community_article else article.id }}" data-is-community="{{ 'true' if is_community_article else 'false' }}" data-title="{{ article.title|e }}" data-source-name="{{ (article.author.name if is_community_article and article.author else article.source.name)|e }}" data-image-url="{{ (article.image_url if is_community_article else article.urlToImage)|e }}" data-description="{{ (article.description if article.description else '')|e }}" data-published-at="{{ (article.published_at.isoformat() if is_community_article and article.published_at else (article.publishedAt if not is_community_article and article.publishedAt else ''))|e }}"><i class="fa-solid fa-bookmark"></i></button>
         {% endif %}
     </div>
-
     <h1 class="mb-2 article-title-main display-6">{{ article.title }}</h1>
-    <div class="article-meta-detailed">
-        <span class="meta-item" title="Source"><i class="fas fa-{{ 'user-edit' if is_community_article else 'building' }}"></i> {{ article.author.name if is_community_article and article.author else article.source.name }}</span>
-        <span class="meta-item" title="Published Date"><i class="far fa-calendar-alt"></i> {{ (article.published_at | to_ist if is_community_article else (article.publishedAt | to_ist if article.publishedAt else 'N/A')) }}</span>
-    </div>
+    <div class="article-meta-detailed d-flex align-items-center flex-wrap gap-3 text-muted small"><span class="meta-item" title="Source"><i class="fas fa-{{ 'user-edit' if is_community_article else 'building' }}"></i> {{ article.author.name if is_community_article and article.author else article.source.name }}</span><span class="meta-item" title="Published Date"><i class="far fa-calendar-alt"></i> {{ (article.published_at | to_ist if is_community_article else (article.publishedAt | to_ist if article.publishedAt else 'N/A')) }}</span></div>
     {% set image_to_display = article.image_url if is_community_article else article.urlToImage %}
-    {% if image_to_display %}<img src="{{ image_to_display }}" alt="{{ article.title|truncate(50) }}" class="main-article-image">{% endif %}
-
-    <div id="contentLoader" class="loader-container my-4 {% if is_community_article %}d-none{% endif %}"><div class="loader"></div><div>Analyzing article and generating summary in 5 to 6 seconds...</div></div>
-
+    {% if image_to_display %}<img src="{{ image_to_display }}" alt="{{ article.title|truncate(50) }}" class="img-fluid rounded my-3 shadow-sm">{% endif %}
+    
+    <div id="contentLoader" class="loader-container my-4 {% if is_community_article %}d-none{% endif %}"><div class="loader"></div><div>Analyzing article and generating summary...</div></div>
     <div id="articleAnalysisContainer">
     {% if is_community_article %}
-        {% if article.groq_summary %}
-            <div class="summary-box my-3"><h5><i class="fas fa-book-open me-2"></i>Article Summary (AI Enhanced)</h5><p class="mb-0">{{ article.groq_summary|replace('\\n', '<br>')|safe }}</p></div>
-        {% elif not article.groq_summary and groq_client %} 
-            <div class="alert alert-secondary small p-3 mt-3">AI Summary not available for this community article.</div>
-        {% endif %}
-
-        {% if article.parsed_takeaways %}
-            <div class="takeaways-box my-3"><h5><i class="fas fa-list-check me-2"></i>Key Takeaways (AI Enhanced)</h5>
-                <ul>{% for takeaway in article.parsed_takeaways %}<li>{{ takeaway }}</li>{% endfor %}</ul>
-            </div>
-        {% elif not article.groq_takeaways and groq_client %} 
-            <div class="alert alert-secondary small p-3 mt-3">AI Takeaways not available for this community article.</div>
-        {% endif %}
-        <hr class="my-4">
-        <h4 class="mb-3">Full Article Content</h4>
-        <div class="content-text">{{ article.full_text }}</div>
-    {% else %}
-        {# API Article content will be loaded here by JavaScript #}
-        <div id="apiArticleContent"></div>
-    {% endif %}
+        {% if article.groq_summary %}<div class="summary-box my-3"><h5><i class="fas fa-book-open me-2"></i>AI Summary</h5><p class="mb-0">{{ article.groq_summary|replace('\\n', '<br>')|safe }}</p></div>{% endif %}
+        {% if article.parsed_takeaways %}<div class="takeaways-box my-3"><h5><i class="fas fa-list-check me-2"></i>AI Key Takeaways</h5><ul>{% for takeaway in article.parsed_takeaways %}<li>{{ takeaway }}</li>{% endfor %}</ul></div>{% endif %}
+        <hr class="my-4"><h4 class="mb-3">Full Article Content</h4><div class="content-text">{{ article.full_text }}</div>
+    {% else %}<div id="apiArticleContent"></div>{% endif %}
     </div>
 
-    <section class="comment-section" id="comment-section">
-        <h3 class="mb-4">Community Discussion (<span id="comment-count">{{ comments|length }}</span>)</h3>
-        {% macro render_comment_with_replies(comment, comment_data, is_logged_in, article_hash_id_for_js) %}
-            <div class="comment-container" id="comment-{{ comment.id }}">
-                <div class="comment-card">
-                    <div class="comment-avatar" title="{{ comment.author.name if comment.author else 'Unknown' }}">{{ (comment.author.name[0]|upper if comment.author and comment.author.name else 'U') }}</div>
-                    <div class="comment-body">
-                        <div class="comment-header">
-                            <span class="comment-author">{{ comment.author.name if comment.author else 'Anonymous' }}</span>
-                            <span class="comment-date">{{ comment.timestamp | to_ist }}</span>
-                        </div>
-                        <p class="comment-content mb-2">{{ comment.content }}</p>
-                        {% if is_logged_in %}
-                        <div class="comment-actions">
-                            <button class="vote-btn {% if comment_data.get(comment.id, {}).get('user_vote') == 1 %}active{% endif %}" data-comment-id="{{ comment.id }}" data-vote-type="1" title="Like"><i class="fas fa-thumbs-up"></i> <span class="vote-count" id="likes-count-{{ comment.id }}">{{ comment_data.get(comment.id, {}).get('likes', 0) }}</span></button>
-                            <button class="vote-btn {% if comment_data.get(comment.id, {}).get('user_vote') == -1 %}active{% endif %}" data-comment-id="{{ comment.id }}" data-vote-type="-1" title="Dislike"><i class="fas fa-thumbs-down"></i> <span class="vote-count" id="dislikes-count-{{ comment.id }}">{{ comment_data.get(comment.id, {}).get('dislikes', 0) }}</span></button>
-                            <button class="reply-btn" data-comment-id="{{ comment.id }}" title="Reply"><i class="fas fa-reply"></i> Reply</button>
-                        </div>
-                        <div class="reply-form-container" id="reply-form-container-{{ comment.id }}">
-                            <form class="reply-form mt-2">
-                                <input type="hidden" name="article_hash_id" value="{{ article_hash_id_for_js }}">
-                                <input type="hidden" name="parent_id" value="{{ comment.id }}">
-                                <div class="mb-2"><textarea class="form-control form-control-sm" name="content" rows="2" placeholder="Write a reply..." required></textarea></div>
-                                <button type="submit" class="btn btn-sm btn-primary-modal">Post Reply</button>
-                                <button type="button" class="btn btn-sm btn-outline-secondary-modal cancel-reply-btn">Cancel</button>
-                            </form>
-                        </div>
-                        {% endif %}
-                    </div>
-                </div>
-                <div class="comment-replies" id="replies-of-{{ comment.id }}">
-                    {% for reply in comment.replies|sort(attribute='timestamp') %} {{ render_comment_with_replies(reply, comment_data, is_logged_in, article_hash_id_for_js) }} {% endfor %}
-                </div>
-            </div>
-        {% endmacro %}
+    <section class="comment-section mt-5" id="comment-section">
+        <h3 class="mb-4">Community Discussion (<span id="comment-count">{{ total_comment_count }}</span>)</h3>
+        
         <div id="comments-list">
-            {% for comment in comments %} {{ render_comment_with_replies(comment, comment_data, session.user_id, (article.article_hash_id if is_community_article else article.id)) }}
-            {% else %}<p id="no-comments-msg">No comments yet. Be the first to share your thoughts!</p>{% endfor %}
+            {% for comment in comments %}
+                {% include '_COMMENT_TEMPLATE' %}
+            {% else %}
+                <p id="no-comments-msg" class="text-muted mt-3">No comments yet. Be the first to share your thoughts!</p>
+            {% endfor %}
         </div>
+
         {% if session.user_id %}
             <div class="add-comment-form mt-4 pt-4 border-top">
                 <h5 class="mb-3">Leave a Comment</h5>
                 <form id="comment-form">
-                    <input type="hidden" name="article_hash_id" value="{{ article.article_hash_id if is_community_article else article.id }}">
                     <div class="mb-3"><textarea class="form-control" id="comment-content" name="content" rows="4" placeholder="Share your insights..." required></textarea></div>
-                    <button type="submit" class="btn btn-primary-modal">Post Comment</button>
+                    <button type="submit" class="btn btn-primary">Post Comment</button>
                 </form>
             </div>
-        {% else %}<div class="alert alert-light mt-4 text-center">Please <a href="{{ url_for('login', next=request.url) }}">log in</a> to join the discussion.</div>{% endif %}
+        {% else %}
+            <div class="alert alert-light mt-4 text-center">Please <a href="{{ url_for('login', next=request.url) }}" class="fw-bold">log in</a> to join the discussion.</div>
+        {% endif %}
     </section>
 </article>
 {% endif %}
@@ -1819,178 +2376,277 @@ ARTICLE_HTML_TEMPLATE = """
 {% block scripts_extra %}
 <script>
 document.addEventListener('DOMContentLoaded', function () {
-    {% if article %} 
-    const isCommunityArticle = {{ is_community_article | tojson }};
-    const articleHashIdGlobal = {{ (article.article_hash_id if is_community_article else article.id) | tojson }};
-    const isUserLoggedIn = {{ 'true' if session.user_id else 'false' }};
-    const groqConfiguredGlobal = {{ groq_client | tojson }}; // Passed from inject_global_vars
+    try {
+        {% if article %}
+        const articleHashIdGlobal = {{ (article.article_hash_id if is_community_article else article.id) | tojson }};
+        const isUserLoggedIn = {{ 'true' if session.user_id else 'false' }};
+        const isCommunityArticle = {{ is_community_article | tojson }};
 
-    function convertUTCToIST(utcIsoString) {
-        if (!utcIsoString) return "N/A";
-        const date = new Date(utcIsoString);
-        return new Intl.DateTimeFormat('en-IN', { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata', timeZoneName: 'short' }).format(date);
-    }
-
-    if (!isCommunityArticle && articleHashIdGlobal) {
-        const contentLoader = document.getElementById('contentLoader');
-        const apiArticleContent = document.getElementById('apiArticleContent');
-
-        fetch(`{{ url_for('get_article_content_json', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashIdGlobal))
-            .then(response => {
-                if (!response.ok) { throw new Error('Network response error: ' + response.statusText + ' (' + response.status + ')'); }
-                return response.json();
-            })
-            .then(data => {
-                if(contentLoader) contentLoader.style.display = 'none';
-                if (!apiArticleContent) return;
-
-                let html = '';
-                const articleUrl = {{ article.url | tojson if article and not is_community_article else 'null' }};
-                const articleSourceName = {{ article.source.name | tojson if article and not is_community_article and article.source else 'Source'|tojson }};
-
-                if (data.error && !data.groq_analysis) {
-                    html = `<div class="alert alert-warning small p-3 mt-3">Could not load article content: ${data.error}</div>`;
-                } else {
+        if (!isCommunityArticle) {
+            const contentLoader = document.getElementById('contentLoader');
+            const apiArticleContent = document.getElementById('apiArticleContent');
+            
+            fetch(`{{ url_for('get_article_content_json', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashIdGlobal))
+                .then(response => { if (!response.ok) { throw new Error(`Network error, status: ${response.status}`); } return response.json(); })
+                .then(data => {
+                    if (data.error) { throw new Error(data.error); }
+                    let html = '';
+                    const articleUrl = {{ article.url | tojson if article and not is_community_article else 'null' }};
+                    const articleSourceName = {{ article.source.name | tojson if article and not is_community_article and article.source else 'Source'|tojson }};
                     const analysis = data.groq_analysis;
                     if (analysis) {
-                        if (analysis.error) {
-                            if(groqConfiguredGlobal) { html += `<div class="alert alert-secondary small p-3 mt-3">AI analysis could not be performed for this article: ${analysis.error}</div>`; }
-                            else { html += `<div class="alert alert-info small p-3 mt-3">AI analysis features are currently not configured.</div>`; }
-                        } else {
-                            let contentAdded = false;
-                            if (analysis.groq_summary && typeof analysis.groq_summary === 'string' && analysis.groq_summary.trim() !== "") {
-                                html += `<div class="summary-box my-3"><h5><i class="fas fa-book-open me-2"></i>Article Summary (AI Enhanced)</h5><p class="mb-0">${analysis.groq_summary.replace(/\\n/g, '<br>')}</p></div>`;
-                                contentAdded = true;
-                            }
-                            if (analysis.groq_takeaways && Array.isArray(analysis.groq_takeaways) && analysis.groq_takeaways.length > 0) {
-                                html += `<div class="takeaways-box my-3"><h5><i class="fas fa-list-check me-2"></i>Key Takeaways (AI Enhanced)</h5><ul>${analysis.groq_takeaways.map(t => `<li>${String(t)}</li>`).join('')}</ul></div>`;
-                                contentAdded = true;
-                            }
-                            if (!contentAdded && groqConfiguredGlobal) {
-                                html += `<div class="alert alert-secondary small p-3 mt-3">AI-generated summary and takeaways for this article are currently empty or not available.</div>`;
-                            } else if (!groqConfiguredGlobal && !contentAdded) {
-                                 html += `<div class="alert alert-info small p-3 mt-3">AI analysis features are currently disabled.</div>`;
-                            }
+                        if (analysis.error) { html += `<div class="alert alert-secondary small p-3 mt-3">AI analysis could not be performed: ${analysis.error}</div>`; }
+                        else {
+                            if (analysis.groq_summary) { html += `<div class="summary-box my-3"><h5><i class="fas fa-book-open me-2"></i>AI Summary</h5><p class="mb-0">${analysis.groq_summary.replace(/\\n/g, '<br>')}</p></div>`; }
+                            if (analysis.groq_takeaways && analysis.groq_takeaways.length > 0) { html += `<div class="takeaways-box my-3"><h5><i class="fas fa-list-check me-2"></i>AI Key Takeaways</h5><ul>${analysis.groq_takeaways.map(t => `<li>${String(t)}</li>`).join('')}</ul></div>`; }
                         }
-                    } else if (groqConfiguredGlobal) {
-                        html = `<div class="alert alert-warning small p-3 mt-3">AI analysis data is missing for this article.</div>`;
-                    } else {
-                         html = `<div class="alert alert-info small p-3 mt-3">AI analysis features are currently disabled.</div>`;
+                    }
+                    if (articleUrl) { html += `<hr class="my-4"><a href="${articleUrl}" class="btn btn-outline-primary mt-3 mb-3" target="_blank" rel="noopener noreferrer">Read Original Article at ${articleSourceName} <i class="fas fa-external-link-alt ms-1"></i></a>`; }
+                    apiArticleContent.innerHTML = html;
+                })
+                .catch(error => { console.error("Failed to load article content:", error); if (apiArticleContent) { apiArticleContent.innerHTML = `<div class="alert alert-danger small p-3">Failed to load article analysis. Details: ${error.message}</div>`; } })
+                .finally(() => { if (contentLoader) contentLoader.style.display = 'none'; });
+        }
+
+        const commentSection = document.getElementById('comment-section');
+        if (commentSection && isUserLoggedIn) {
+            
+            const handleCommentSubmit = (formElement) => {
+                const content = formElement.querySelector('textarea[name="content"]').value;
+                const parentId = formElement.querySelector('input[name="parent_id"]')?.value || null;
+                if (!content.trim()) return;
+                const submitButton = formElement.querySelector('button[type="submit"]');
+                const originalButtonText = submitButton.innerHTML;
+                submitButton.disabled = true;
+                submitButton.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Posting...';
+                fetch(`{{ url_for('add_comment', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashIdGlobal), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ content, parent_id: parentId })
+                })
+                .then(res => {
+                    if (res.status === 401) { throw new Error("Your session has expired. Please refresh the page and log in again."); }
+                    if (!res.ok) { throw new Error("An unknown server error occurred while posting."); }
+                    return res.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        const noCommentsMsg = document.getElementById('no-comments-msg');
+                        if (noCommentsMsg) noCommentsMsg.remove();
+                        if (data.parent_id) {
+                            document.getElementById(`replies-of-${data.parent_id}`).insertAdjacentHTML('beforeend', data.html);
+                            formElement.closest('.reply-form-container').style.display = 'none';
+                        } else {
+                            document.getElementById('comments-list').insertAdjacentHTML('beforeend', data.html);
+                        }
+                        const countEl = document.getElementById('comment-count');
+                        countEl.textContent = parseInt(countEl.textContent) + 1;
+                        formElement.reset();
+                    } else { throw new Error(data.error || 'Could not post comment.'); }
+                })
+                .catch(err => { console.error("Comment submission error:", err); alert("Error: " + err.message); })
+                .finally(() => { submitButton.disabled = false; submitButton.innerHTML = originalButtonText; });
+            };
+
+            const updateReactionUI = (commentId, reactions, userReaction) => {
+                const summaryContainer = document.getElementById(`reaction-summary-${commentId}`);
+                if (!summaryContainer) return;
+                let summaryHTML = '';
+                if (reactions) {
+                    for (const [emoji, count] of Object.entries(reactions)) {
+                        if (count > 0) {
+                            const userReactedClass = (userReaction === emoji) ? 'user-reacted' : '';
+                            summaryHTML += `<div class="reaction-pill ${userReactedClass}" data-emoji="${emoji}"><span class="emoji">${emoji}</span> <span class="count">${count}</span></div>`;
+                        }
                     }
                 }
-                if (articleUrl) { html += `<hr class="my-4"><a href="${articleUrl}" class="btn btn-outline-primary mt-3 mb-3" target="_blank" rel="noopener noreferrer">Read Original Article at ${articleSourceName} <i class="fas fa-external-link-alt ms-1"></i></a>`; }
-                apiArticleContent.innerHTML = html;
-            })
-            .catch(error => {
-                if(contentLoader) contentLoader.innerHTML = `<div class="alert alert-danger small p-3">Failed to load article analysis. Details: ${error.message}</div>`;
-                console.error("Error fetching article content:", error);
-            });
-    }
+                summaryContainer.innerHTML = summaryHTML;
+            };
 
-    const commentSection = document.getElementById('comment-section');
-    function createCommentHTML(comment, articleHashIdForJs) {
-        const commentDate = convertUTCToIST(comment.timestamp);
-        const authorName = comment.author && comment.author.name ? comment.author.name : 'Anonymous';
-        const userInitial = authorName[0].toUpperCase();
-        let actionsHTML = '';
-        if (isUserLoggedIn) {
-            actionsHTML = `
-            <div class="comment-actions">
-                <button class="vote-btn <span class="math-inline">\{comment\.user\_vote \=\=\= 1 ? 'active' \: ''\}" data\-comment\-id\="</span>{comment.id}" data-vote-type="1" title="Like"><i class="fas fa-thumbs-up"></i> <span class="vote-count" id="likes-count-<span class="math-inline">\{comment\.id\}"\></span>{comment.likes || 0}</span></button>
-                <button class="vote-btn <span class="math-inline">\{comment\.user\_vote \=\=\= \-1 ? 'active' \: ''\}" data\-comment\-id\="</span>{comment.id}" data-vote-type="-1" title="Dislike"><i class="fas fa-thumbs-down"></i> <span class="vote-count" id="dislikes-count-<span class="math-inline">\{comment\.id\}"\></span>{comment.dislikes || 0}</span></button>
-                <button class="reply-btn" data-comment-id="<span class="math-inline">\{comment\.id\}" title\="Reply"\><i class\="fas fa\-reply"\></i\> Reply</button\>
-</div\>
-<div class\="reply\-form\-container" id\="reply\-form\-container\-</span>{comment.id}">
-                <form class="reply-form mt-2">
-                    <input type="hidden" name="article_hash_id" value="<span class="math-inline">\{articleHashIdForJs\}"\><input type\="hidden" name\="parent\_id" value\="</span>{comment.id}">
-                    <div class="mb-2"><textarea class="form-control form-control-sm" name="content" rows="2" placeholder="Write a reply..." required></textarea></div>
-                    <button type="submit" class="btn btn-sm btn-primary-modal">Post Reply</button><button type="button" class="btn btn-sm btn-outline-secondary-modal cancel-reply-btn">Cancel</button>
-                </form>
-            </div>`;
+            // Main event listener for all actions in the comment section
+            commentSection.addEventListener('click', function(e) {
+                const target = e.target;
+                const replyBtn = target.closest('.reply-btn');
+                const cancelBtn = target.closest('.cancel-reply-btn');
+                const reactBtn = target.closest('.react-btn');
+                const reactionEmoji = target.closest('.reaction-emoji');
+
+                if (replyBtn) {
+                    e.preventDefault();
+                    const commentId = replyBtn.dataset.commentId;
+                    const formContainer = document.getElementById(`reply-form-container-${commentId}`);
+                    if (formContainer) {
+                        const isDisplayed = formContainer.style.display === 'block';
+                        document.querySelectorAll('.reply-form-container').forEach(fc => fc.style.display = 'none');
+                        formContainer.style.display = isDisplayed ? 'none' : 'block';
+                        if (!isDisplayed) formContainer.querySelector('textarea').focus();
+                    }
+                    return;
+                }
+
+                if (cancelBtn) {
+                    e.preventDefault();
+                    cancelBtn.closest('.reply-form-container').style.display = 'none';
+                    return;
+                }
+                
+                if (reactBtn) {
+                    e.preventDefault();
+                    const commentId = reactBtn.dataset.commentId;
+                    const reactionBox = document.getElementById(`reaction-box-${commentId}`);
+                    if (reactionBox) {
+                        const isShown = reactionBox.classList.contains('show');
+                        document.querySelectorAll('.reaction-box').forEach(box => box.classList.remove('show'));
+                        if (!isShown) reactionBox.classList.add('show');
+                    }
+                    return;
+                }
+                
+                if (reactionEmoji) {
+                    e.preventDefault();
+                    const commentId = reactionEmoji.dataset.commentId;
+                    const emoji = reactionEmoji.dataset.emoji;
+                    reactionEmoji.closest('.reaction-box').classList.remove('show');
+                    fetch(`{{ url_for('vote_comment', comment_id=0) }}`.replace('0', commentId), {
+                        method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                        body: JSON.stringify({ emoji: emoji })
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.success) { updateReactionUI(commentId, data.reactions, data.user_reaction); }
+                        else { throw new Error(data.error || "Failed to vote."); }
+                    })
+                    .catch(err => { console.error("Reaction error:", err); alert("Error: " + err.message); });
+                    return;
+                }
+
+                if (!target.closest('.reaction-box') && !target.closest('.react-btn')) {
+                    document.querySelectorAll('.reaction-box.show').forEach(box => box.classList.remove('show'));
+                }
+            });
+
+            const mainCommentForm = document.getElementById('comment-form');
+            if(mainCommentForm) { mainCommentForm.addEventListener('submit', function(e) { e.preventDefault(); handleCommentSubmit(this); }); }
+            commentSection.addEventListener('submit', function(e) { if(e.target.matches('.reply-form')) { e.preventDefault(); handleCommentSubmit(e.target); } });
         }
-        return `<div class="comment-container" id="comment-<span class="math-inline">\{comment\.id\}"\><div class\="comment\-card"\><div class\="comment\-avatar" title\="</span>{authorName}"><span class="math-inline">\{userInitial\}</div\><div class\="comment\-body"\><div class\="comment\-header"\><span class\="comment\-author"\></span>{authorName}</span><span class="comment-date"><span class="math-inline">\{commentDate\}</span\></div\><p class\="comment\-content mb\-2"\></span>{comment.content}</p><span class="math-inline">\{actionsHTML\}</div\></div\><div class\="comment\-replies" id\="replies\-of\-</span>{comment.id}"></div></div>`;
-    }
-    function handleCommentSubmit(form, articleHashId, parentId = null) {
-        const content = form.querySelector('textarea[name="content"]').value; if (!content.trim()) return;
-        const submitButton = form.querySelector('button[type="submit"]'); const originalButtonText = submitButton.innerHTML; submitButton.disabled = true; submitButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Posting...';
-        fetch(`{{ url_for('add_comment', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: content, parent_id: parentId }) })
-        .then(res => { if (!res.ok) { return res.json().then(err => { throw new Error(err.error || `HTTP error! status: ${res.status}`); }); } return res.json(); })
-        .then(data => {
-            if (data.success) {
-                const newCommentHTML = createCommentHTML(data.comment, articleHashId); const tempDiv = document.createElement('div'); tempDiv.innerHTML = newCommentHTML.trim(); const newCommentNode = tempDiv.firstChild;
-                if (parentId) { document.getElementById(`replies-of-${parentId}`).appendChild(newCommentNode); form.closest('.reply-form-container').style.display = 'none'; }
-                else { const list = document.getElementById('comments-list'); const noCommentsMsg = document.getElementById('no-comments-msg'); if (noCommentsMsg) noCommentsMsg.remove(); list.appendChild(newCommentNode); const countEl = document.getElementById('comment-count'); countEl.textContent = parseInt(countEl.textContent) + 1; }
-                form.reset();
-            } else { alert('Error: ' + (data.error || 'Unknown error posting comment.')); }
-        })
-        .catch(err => { console.error("Comment submission error:", err); alert("Could not submit comment: " + err.message); })
-        .finally(() => { submitButton.disabled = false; submitButton.innerHTML = originalButtonText; });
-    }
-    const mainCommentForm = document.getElementById('comment-form');
-    if (mainCommentForm) { mainCommentForm.addEventListener('submit', function(e) { e.preventDefault(); const articleHashIdFromForm = this.querySelector('input[name="article_hash_id"]').value; handleCommentSubmit(this, articleHashIdFromForm); }); }
-    if (commentSection) {
-        commentSection.addEventListener('click', function(e) {
-            const voteBtn = e.target.closest('.vote-btn');
-            if (voteBtn && isUserLoggedIn) {
-                const commentId = voteBtn.dataset.commentId; const voteType = parseInt(voteBtn.dataset.voteType);
-                fetch(`{{ url_for('vote_comment', comment_id=0) }}`.replace('0', commentId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vote_type: voteType }) })
-                .then(res => { if (!res.ok) { return res.json().then(err => { throw new Error(err.error || `HTTP error! status: ${res.status}`); }); } return res.json(); })
+
+        const bookmarkBtn = document.getElementById('bookmarkBtn');
+        if (bookmarkBtn && isUserLoggedIn) {
+            bookmarkBtn.addEventListener('click', function() {
+                const articleHashId = this.dataset.articleHashId; 
+                const isCommunity = this.dataset.isCommunity; 
+                const title = this.dataset.title; 
+                const sourceName = this.dataset.sourceName; 
+                const imageUrl = this.dataset.imageUrl; 
+                const description = this.dataset.description; 
+                const publishedAt = this.dataset.publishedAt;
+                fetch(`{{ url_for('toggle_bookmark', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_community_article: isCommunity, title, source_name: sourceName, image_url: imageUrl, description, published_at: publishedAt }) })
+                .then(res => res.json())
                 .then(data => {
-                    if(data.success) {
-                        document.getElementById(`likes-count-${commentId}`).textContent = data.likes; document.getElementById(`dislikes-count-${commentId}`).textContent = data.dislikes;
-                        const allVoteBtnsOnComment = document.querySelectorAll(`.vote-btn[data-comment-id="${commentId}"]`); allVoteBtnsOnComment.forEach(btn => btn.classList.remove('active'));
-                        if(data.user_vote === 1) { document.querySelector(`.vote-btn[data-comment-id="${commentId}"][data-vote-type="1"]`).classList.add('active'); }
-                        else if (data.user_vote === -1) { document.querySelector(`.vote-btn[data-comment-id="${commentId}"][data-vote-type="-1"]`).classList.add('active'); }
-                    } else { alert('Error voting: ' + (data.error || 'Unknown error.')); }
-                }).catch(err => { console.error("Vote error:", err); alert("Could not process vote: " + err.message); });
-            }
-            const replyBtn = e.target.closest('.reply-btn');
-            if (replyBtn && isUserLoggedIn) {
-                const commentId = replyBtn.dataset.commentId; const formContainer = document.getElementById(`reply-form-container-${commentId}`);
-                if (formContainer) { const isDisplayed = formContainer.style.display === 'block'; document.querySelectorAll('.reply-form-container').forEach(fc => { if (fc.id !== `reply-form-container-${commentId}`) fc.style.display = 'none'; }); formContainer.style.display = isDisplayed ? 'none' : 'block'; if(formContainer.style.display === 'block') { formContainer.querySelector('textarea').focus(); } }
-            }
-            const cancelReplyBtn = e.target.closest('.cancel-reply-btn');
-            if (cancelReplyBtn) { const formContainer = cancelReplyBtn.closest('.reply-form-container'); formContainer.style.display = 'none'; formContainer.querySelector('form').reset(); }
-        });
-        commentSection.addEventListener('submit', function(e) {
-            const replyForm = e.target.closest('.reply-form');
-            if (replyForm) { e.preventDefault(); const articleHashIdFromForm = replyForm.querySelector('input[name="article_hash_id"]').value; const parentId = replyForm.querySelector('input[name="parent_id"]').value; handleCommentSubmit(replyForm, articleHashIdFromForm, parentId); }
-        });
+                    if (data.success) {
+                        this.classList.toggle('active', data.status === 'added'); 
+                        this.title = data.status === 'added' ? 'Remove Bookmark' : 'Add Bookmark';
+                    } else { alert('Error: ' + (data.error || 'Could not update bookmark.')); }
+                })
+                .catch(err => { console.error("Bookmark error:", err); alert("Could not update bookmark: " + err.message); });
+            });
+        }
+        {% endif %}
+    } catch (e) {
+        console.error("A critical error occurred on the article page:", e);
     }
-    const bookmarkBtn = document.getElementById('bookmarkBtn');
-    if (bookmarkBtn && isUserLoggedIn) {
-        bookmarkBtn.addEventListener('click', function() {
-            const articleHashId = this.dataset.articleHashId; const isCommunity = this.dataset.isCommunity; const title = this.dataset.title; const sourceName = this.dataset.sourceName; const imageUrl = this.dataset.imageUrl; const description = this.dataset.description; const publishedAt = this.dataset.publishedAt;
-            fetch(`{{ url_for('toggle_bookmark', article_hash_id='PLACEHOLDER') }}`.replace('PLACEHOLDER', articleHashId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_community_article: isCommunity, title: title, source_name: sourceName, image_url: imageUrl, description: description, published_at: publishedAt }) })
-            .then(res => { if (!res.ok) { return res.json().then(err => { throw new Error(err.error || `HTTP error! status: ${res.status}`); }); } return res.json(); })
-            .then(data => {
-                if (data.success) {
-                    this.classList.toggle('active', data.status === 'added'); this.title = data.status === 'added' ? 'Remove Bookmark' : 'Add Bookmark';
-                    const alertPlaceholder = document.getElementById('alert-placeholder');
-                    if(alertPlaceholder) { const existingAlerts = alertPlaceholder.querySelectorAll('.bookmark-alert'); existingAlerts.forEach(al => bootstrap.Alert.getOrCreateInstance(al)?.close()); const alertDiv = `<div class="alert alert-info alert-dismissible fade show alert-top bookmark-alert" role="alert" style="z-index: 2060;">${data.message}<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>`; alertPlaceholder.insertAdjacentHTML('beforeend', alertDiv); const newAlert = alertPlaceholder.lastChild; setTimeout(() => { bootstrap.Alert.getOrCreateInstance(newAlert)?.close(); }, 3000); }
-                } else { alert('Error: ' + (data.error || 'Could not update bookmark.')); }
-            })
-            .catch(err => { console.error("Bookmark error:", err); alert("Could not update bookmark: " + err.message); });
-        });
-    }
-    {% endif %} 
 });
 </script>
 {% endblock %}
 """
 
+_COMMENT_TEMPLATE = """
+<div class="comment-thread" id="comment-{{ comment.id }}">
+    <div class="comment-container">
+        <div class="comment-avatar" title="{{ comment.author.name if comment.author else 'Unknown' }}">{{ (comment.author.name[0]|upper if comment.author and comment.author.name else 'U') }}</div>
+        <div class="comment-body">
+            <div class="comment-header">
+                {# THE CHANGE IS HERE: The span is now an <a> tag #}
+                <a href="{{ url_for('public_profile', username=comment.author.username) }}" class="comment-author text-decoration-none">{{ comment.author.name if comment.author else 'Anonymous' }}</a>
+                <span class="comment-date">{{ comment.timestamp | to_ist }}</span>
+            </div>
+            <p class="comment-content mb-2">{{ comment.content }}</p>
+            
+            {% if session.user_id %}
+            <div class="comment-actions">
+                <div class="reaction-box" id="reaction-box-{{ comment.id }}">
+                    {% for emoji in ['👍', '❤️', '😂', '😮', '😢', '😠'] %}
+                        <span class="reaction-emoji" data-emoji="{{ emoji }}" data-comment-id="{{ comment.id }}" title="{{ emoji }}">{{ emoji }}</span>
+                    {% endfor %}
+                </div>
+                <button class="react-btn" data-comment-id="{{ comment.id }}" title="React"><i class="far fa-smile"></i> React</button>
+                <button class="reply-btn" data-comment-id="{{ comment.id }}" title="Reply"><i class="fas fa-reply"></i> Reply</button>
+            </div>
+            <div class="reply-form-container" id="reply-form-container-{{ comment.id }}" style="display:none;">
+                <form class="reply-form">
+                    <input type="hidden" name="parent_id" value="{{ comment.id }}">
+                    <div class="mb-2"><textarea class="form-control form-control-sm" name="content" rows="2" placeholder="Write a reply..." required></textarea></div>
+                    <div class="d-flex justify-content-end gap-2">
+                        <button type="button" class="btn btn-sm btn-outline-secondary cancel-reply-btn">Cancel</button>
+                        <button type="submit" class="btn btn-sm btn-primary">Post Reply</button>
+                    </div>
+                </form>
+            </div>
+            {% endif %}
+
+            <div class="reaction-summary" id="reaction-summary-{{ comment.id }}">
+            </div>
+        </div>
+    </div>
+    <div class="comment-replies" id="replies-of-{{ comment.id }}">
+        {% for comment in comment.replies %}
+            {% include '_COMMENT_TEMPLATE' %}
+        {% endfor %}
+    </div>
+</div>
+"""
+
 LOGIN_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
 {% block title %}Login - BrieflyAI{% endblock %}
+{% block body_class %}body-auth{% endblock %}
+
 {% block content %}
-<div class="auth-container article-card animate-fade-in mx-auto">
-    <h2 class="auth-title mb-4"><i class="fas fa-sign-in-alt me-2"></i>Member Login</h2>
-    <form method="POST" action="{{ url_for('login', next=request.args.get('next')) }}">
-        <div class="modal-form-group"><label for="username" class="form-label">Username</label><input type="text" class="modal-form-control" id="username" name="username" required placeholder="Enter your username"></div>
-        <div class="modal-form-group"><label for="password" class="form-label">Password</label><input type="password" class="modal-form-control" id="password" name="password" required placeholder="Enter your password"></div>
-        <button type="submit" class="btn btn-primary-modal w-100 mt-3">Login</button>
-    </form>
-    <p class="mt-3 text-center small">Don't have an account? <a href="{{ url_for('register', next=request.args.get('next')) }}" class="fw-medium">Register here</a></p>
+<div class="auth-card animate-fade-in">
+    <div class="auth-header">
+        <div class="brand-icon"><i class="fas fa-bolt-lightning"></i></div>
+        <h2>Welcome Back to Briefly</h2>
+    </div>
+    <div class="auth-body">
+        <form method="POST" action="{{ url_for('login', next=request.args.get('next')) }}">
+            <div class="mb-3">
+                <label for="username" class="form-label fw-medium">Username</label>
+                <div class="input-group-icon">
+                    <i class="fas fa-user input-icon"></i>
+                    <input type="text" class="form-control" id="username" name="username" required placeholder="e.g. user123">
+                </div>
+            </div>
+            <div class="mb-4">
+                <label for="password" class="form-label fw-medium">Password</label>
+                <div class="input-group-icon">
+                    <i class="fas fa-lock input-icon"></i>
+                    <input type="password" class="form-control" id="password" name="password" required placeholder="••••••••">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Sign In</button>
+        </form>
+        
+        <div class="social-login-divider">Or</div>
+
+        <div class="social-login-buttons d-flex gap-3">
+            <a href="#" class="btn w-100"><i class="fab fa-google"></i> Google</a>
+            <a href="#" class="btn w-100"><i class="fab fa-facebook"></i> Facebook</a>
+        </div>
+    </div>
+    <div class="auth-footer">
+        <p class="mb-0 small">
+            Don't have an account? <a href="{{ url_for('register', next=request.args.get('next')) }}" class="fw-bold text-decoration-none">Sign up now</a>
+        </p>
+    </div>
 </div>
 {% endblock %}
 """
@@ -1998,37 +2654,81 @@ LOGIN_HTML_TEMPLATE = """
 REGISTER_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
 {% block title %}Register - BrieflyAI{% endblock %}
+{% block body_class %}body-auth{% endblock %}
+
 {% block content %}
-<div class="auth-container article-card animate-fade-in mx-auto">
-    <h2 class="auth-title mb-4"><i class="fas fa-user-plus me-2"></i>Create Account</h2>
-    <form method="POST" action="{{ url_for('register') }}">
-        <div class="modal-form-group"><label for="name" class="form-label">Full Name</label><input type="text" class="modal-form-control" id="name" name="name" required placeholder="Enter your full name"></div>
-        <div class="modal-form-group"><label for="username" class="form-label">Username</label><input type="text" class="modal-form-control" id="username" name="username" required placeholder="Choose a username (min 3 chars)"></div>
-        <div class="modal-form-group"><label for="password" class="form-label">Password</label><input type="password" class="modal-form-control" id="password" name="password" required placeholder="Create a strong password (min 6 chars)"></div>
-        <button type="submit" class="btn btn-primary-modal w-100 mt-3">Register</button>
-    </form>
-    <p class="mt-3 text-center small">Already have an account? <a href="{{ url_for('login') }}" class="fw-medium">Login here</a></p>
+<div class="auth-card animate-fade-in">
+     <div class="auth-header">
+        <div class="brand-icon"><i class="fas fa-user-plus"></i></div>
+        <h2>Create Your Account</h2>
+    </div>
+    <div class="auth-body">
+        <form method="POST" action="{{ url_for('register') }}">
+             <div class="mb-3">
+                <label for="name" class="form-label fw-medium">Full Name</label>
+                <div class="input-group-icon">
+                    <i class="fas fa-id-card input-icon"></i>
+                    <input type="text" class="form-control" id="name" name="name" required placeholder="e.g. John Doe">
+                </div>
+            </div>
+            <div class="mb-3">
+                <label for="username" class="form-label fw-medium">Username</label>
+                <div class="input-group-icon">
+                    <i class="fas fa-user input-icon"></i>
+                    <input type="text" class="form-control" id="username" name="username" required placeholder="e.g. johndoe (min 3 chars)">
+                </div>
+            </div>
+            <div class="mb-4">
+                <label for="password" class="form-label fw-medium">Password</label>
+                <div class="input-group-icon">
+                    <i class="fas fa-lock input-icon"></i>
+                    <input type="password" class="form-control" id="password" name="password" required placeholder="min 6 chars">
+                </div>
+            </div>
+            <button type="submit" class="btn btn-primary w-100">Create Account</button>
+        </form>
+    </div>
+    <div class="auth-footer">
+        <p class="mb-0 small">
+            Already have an account? <a href="{{ url_for('login') }}" class="fw-bold text-decoration-none">Sign In</a>
+        </p>
+    </div>
 </div>
 {% endblock %}
 """
 
 PROFILE_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
-{% block title %}{{ user.name }}'s Profile - {% endblock %}
+{% block title %}{{ user.name }}'s Profile - BrieflyAI{% endblock %}
 {% block content %}
-<div class="profile-card animate-fade-in">
-    <div class="profile-avatar">{{ user.name[0]|upper }}</div>
-    <h2 class="mb-1">{{ user.name }}</h2>
-    <p class="text-muted">@{{ user.username }}</p>
-    <p class="small text-muted">Joined: {{ user.created_at | to_ist }}</p>
+<div class="profile-header-card animate-fade-in">
+    <div class="profile-avatar-wrapper">
+        <div class="profile-avatar">{{ user.name[0]|upper }}</div>
+    </div>
+    <h2>{{ user.name }}</h2>
+    <p class="username">@{{ user.username }}</p>
+    <p class="small text-muted mb-0">Joined: {{ user.created_at | to_ist }}</p>
+    <div class="profile-stats">
+        <div class="stat-item">
+            <div class="icon"><i class="fas fa-feather-pointed"></i></div>
+            <div class="count">{{ posted_articles|length }}</div>
+            <div class="label">Articles Posted</div>
+        </div>
+        <div class="stat-item">
+            <div class="icon"><i class="fas fa-bookmark"></i></div>
+            <div class="count">{{ bookmarks_pagination.total if bookmarks_pagination else 0 }}</div>
+            <div class="label">Bookmarks</div>
+        </div>
+    </div>
 </div>
-<div class="mt-4 animate-fade-in">
+
+<div class="mt-4 animate-fade-in" style="animation-delay: 0.1s;">
     <ul class="nav nav-tabs profile-tabs nav-fill mb-4" id="profileTab" role="tablist">
         <li class="nav-item" role="presentation">
-            <button class="nav-link active" id="bookmarks-tab" data-bs-toggle="tab" data-bs-target="#bookmarks-content" type="button" role="tab" aria-controls="bookmarks-content" aria-selected="true"><i class="fas fa-bookmark me-1"></i>My Bookmarks ({{ bookmarks_pagination.total if bookmarks_pagination else 0 }})</button>
+            <button class="nav-link active" id="bookmarks-tab" data-bs-toggle="tab" data-bs-target="#bookmarks-content" type="button" role="tab" aria-controls="bookmarks-content" aria-selected="true"><i class="fas fa-bookmark me-2"></i>My Bookmarks</button>
         </li>
         <li class="nav-item" role="presentation">
-            <button class="nav-link" id="posted-tab" data-bs-toggle="tab" data-bs-target="#posted-content" type="button" role="tab" aria-controls="posted-content" aria-selected="false"><i class="fas fa-feather-alt me-1"></i>My Posted Articles ({{ posted_articles|length }})</button>
+            <button class="nav-link" id="posted-tab" data-bs-toggle="tab" data-bs-target="#posted-content" type="button" role="tab" aria-controls="posted-content" aria-selected="false"><i class="fas fa-feather-alt me-2"></i>My Articles</button>
         </li>
     </ul>
     <div class="tab-content" id="profileTabContent">
@@ -2040,7 +2740,7 @@ PROFILE_HTML_TEMPLATE = """
                     <article class="article-card d-flex flex-column w-100">
                         <div class="article-image-container">
                             <a href="{{ art.article_url }}"><img src="{{ art.urlToImage if art.urlToImage else 'https://via.placeholder.com/400x220/EEEEEE/AAAAAA?text=No+Image' }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a>
-                            {% if art.is_stale_bookmark %}<span class="category-tag" style="background-color: #777; color:white;">Cached Bookmark</span>{% endif %}
+                            {% if art.is_stale_bookmark %}<span class="badge bg-secondary position-absolute top-0 end-0 m-2">Cached Bookmark</span>{% endif %}
                         </div>
                         <div class="article-body d-flex flex-column">
                             <h5 class="article-title mb-2"><a href="{{ art.article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
@@ -2055,7 +2755,14 @@ PROFILE_HTML_TEMPLATE = """
                 </div>
                 {% endfor %}
             </div>
-            {% else %}<div class="alert alert-light text-center p-4">You haven't bookmarked any articles yet.</div>{% endif %}
+            {% else %}
+                <div class="empty-state-card">
+                    <div class="icon"><i class="fas fa-bookmark"></i></div>
+                    <h4>No Bookmarks Yet</h4>
+                    <p class="text-muted">You haven't bookmarked any articles. Find an article you like and click the bookmark icon to save it!</p>
+                </div>
+            {% endif %}
+
             {% if bookmarks_pagination and bookmarks_pagination.pages > 1 %}
             <nav aria-label="Bookmarks navigation" class="mt-5">
                 <ul class="pagination justify-content-center">
@@ -2071,7 +2778,7 @@ PROFILE_HTML_TEMPLATE = """
             <div class="row g-4">
                 {% for art in posted_articles %}
                 <div class="col-md-6 col-lg-4 d-flex">
-                     <article class="article-card d-flex flex-column w-100">
+                    <article class="article-card d-flex flex-column w-100">
                         {% set article_url = url_for('article_detail', article_hash_id=art.article_hash_id) %}
                         <div class="article-image-container"><a href="{{ article_url }}"><img src="{{ art.image_url if art.image_url else 'https://via.placeholder.com/400x220/EEEEEE/AAAAAA?text=No+Image' }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a></div>
                         <div class="article-body d-flex flex-column">
@@ -2087,8 +2794,62 @@ PROFILE_HTML_TEMPLATE = """
                 </div>
                 {% endfor %}
             </div>
-            {% else %}<div class="alert alert-light text-center p-4">You haven't posted any articles yet. Click the '+' button to share your insights!</div>{% endif %}
+            {% else %}
+                <div class="empty-state-card">
+                    <div class="icon"><i class="fas fa-feather-alt"></i></div>
+                    <h4>Nothing Posted Yet</h4>
+                    <p class="text-muted">You haven't posted any articles. Click the <i class="fas fa-pen-to-square"></i> button to share your first story!</p>
+                </div>
+            {% endif %}
         </div>
+    </div>
+</div>
+{% endblock %}
+"""
+
+PUBLIC_PROFILE_HTML_TEMPLATE = """
+{% extends "BASE_HTML_TEMPLATE" %}
+{% block title %}{{ user.name }}'s Profile - BrieflyAI{% endblock %}
+{% block content %}
+<div class="animate-fade-in">
+    <div class="profile-header-card mb-4">
+        <div class="profile-avatar-wrapper">
+            <div class="profile-avatar">{{ user.name[0]|upper }}</div>
+        </div>
+        <h2>{{ user.name }}</h2>
+        <p class="username">@{{ user.username }}</p>
+        <p class="small text-muted mb-0">Member Since: {{ user.created_at | to_ist }}</p>
+    </div>
+
+    <h3 class="mt-5 mb-4">Articles by {{ user.name }} ({{ posted_articles|length }})</h3>
+    
+    <div class="row g-4">
+    {% if posted_articles %}
+        {% for art in posted_articles %}
+        <div class="col-md-6 col-lg-4 d-flex">
+            <article class="article-card d-flex flex-column w-100">
+                {% set article_url = url_for('article_detail', article_hash_id=art.article_hash_id) %}
+                <div class="article-image-container"><a href="{{ article_url }}"><img src="{{ art.image_url if art.image_url else 'https://via.placeholder.com/400x220/EEEEEE/AAAAAA?text=No+Image' }}" class="article-image" alt="{{ art.title|truncate(50) }}"></a></div>
+                <div class="article-body d-flex flex-column">
+                    <h5 class="article-title mb-2"><a href="{{ article_url }}" class="text-decoration-none">{{ art.title|truncate(70) }}</a></h5>
+                    <div class="article-meta small mb-2">
+                        <span class="meta-item text-muted"><i class="far fa-calendar-alt"></i> {{ art.published_at | to_ist }}</span>
+                    </div>
+                    <p class="article-description small">{{ art.description|truncate(100) }}</p>
+                    <a href="{{ article_url }}" class="read-more btn btn-sm mt-auto">Read More <i class="fas fa-chevron-right ms-1 small"></i></a>
+                </div>
+            </article>
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="col-12">
+            <div class="empty-state-card">
+                <div class="icon"><i class="fas fa-feather-alt"></i></div>
+                <h4>No Articles Yet</h4>
+                <p class="text-muted">{{ user.name }} hasn't posted any articles yet.</p>
+            </div>
+        </div>
+    {% endif %}
     </div>
 </div>
 {% endblock %}
@@ -2096,20 +2857,122 @@ PROFILE_HTML_TEMPLATE = """
 
 ABOUT_US_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
-{% block title %}About Us - {% endblock %}
-{% block content %}<div class="static-content-wrapper animate-fade-in"><h1 class="mb-4">About </h1><p class="lead"> is your premier destination for the latest news from India and around the world, delivered in a concise and easy-to-digest format. We leverage the power of cutting-edge AI to summarize complex news articles into key takeaways, saving you time while keeping you informed.</p><h2 class="mt-5 mb-3">Our Mission</h2><p>In a world of information overload, our mission is to provide clarity and efficiency. We believe that everyone deserves access to accurate, unbiased news without spending hours sifting through lengthy articles.  cuts through the noise, offering insightful summaries that matter.</p><h2 class="mt-5 mb-3">Community Hub</h2><p>Beyond AI-driven news,  is a platform for discussion and community engagement. Our Community Hub allows users to post their own articles, share perspectives, and engage in meaningful conversations about the topics that shape our world. We are committed to fostering a respectful and intelligent environment for all our members.</p><h2 class="mt-5 mb-3">Our Technology</h2><p>We use state-of-the-art Natural Language Processing (NLP) models to analyze and summarize news content from trusted sources. Our system is designed to identify the most crucial points of an article, presenting them as a quick summary and a list of key takeaways.</p></div>{% endblock %}
+{% block title %}About Us - BrieflyAI{% endblock %}
+{% block content %}
+<div class="animate-fade-in">
+    <div class="page-header-static">
+        <h1>About BrieflyAI</h1>
+    </div>
+    <div class="static-content-container">
+        <p class="lead">
+            Welcome to BrieflyAI, your premier destination for the latest news from India and around the world, delivered in a concise and easy-to-digest format. We leverage the power of cutting-edge AI to summarize complex news articles into key takeaways, saving you time while keeping you informed.
+        </p>
+
+        <h2><i class="icon fas fa-bullseye"></i>Our Mission</h2>
+        <p>
+            In a world of information overload, our mission is to provide clarity and efficiency. We believe that everyone deserves access to accurate, unbiased news without spending hours sifting through lengthy articles. BrieflyAI cuts through the noise, offering insightful summaries that matter.
+        </p>
+
+        <h2><i class="icon fas fa-users"></i>Community Hub</h2>
+        <p>
+            Beyond AI-driven news, BrieflyAI is a platform for discussion and community engagement. Our Community Hub allows users to post their own articles, share perspectives, and engage in meaningful conversations about the topics that shape our world. We are committed to fostering a respectful and intelligent environment for all our members.
+        </p>
+
+        <h2><i class="icon fas fa-microchip"></i>Our Technology</h2>
+        <p>
+            We use state-of-the-art Natural Language Processing (NLP) models to analyze and summarize news content from trusted sources. Our system is designed to identify the most crucial points of an article, presenting them as a quick summary and a list of key takeaways, ensuring you get the essence of the story in seconds.
+        </p>
+    </div>
+</div>
+{% endblock %}
 """
 
 CONTACT_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
-{% block title %}Contact Us - {% endblock %}
-{% block content %}<div class="static-content-wrapper animate-fade-in"><h1 class="mb-4">Contact Us</h1><p class="lead">We'd love to hear from you! Whether you have a question, feedback, or a news tip, feel free to reach out.</p><div class="row mt-5"><div class="col-md-6"><h2 class="h4">General Inquiries</h2><p>For general questions, feedback, or support, please email us at:</p><p><i class="fas fa-envelope me-2"></i><a href="mailto:vbansal639@gmail.com">vbansal639@gmail.com</a></p></div><div class="col-md-6"><h2 class="h4">Partnerships & Media</h2><p>For partnership opportunities or media inquiries, please contact:</p><p><i class="fas fa-envelope me-2"></i><a href="mailto:vbansal639@gmail.com">vbansal639@gmail.com</a></p></div></div><div class="mt-5"><h2 class="h4">Follow Us</h2><p>Stay connected with us on social media:</p><div class="social-links fs-4"><a href="#" title="Twitter"><i class="fab fa-twitter"></i></a><a href="#" title="Facebook"><i class="fab fa-facebook-f"></i></a><a href="#" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a><a href="#" title="Instagram"><i class="fab fa-instagram"></i></a></div></div></div>{% endblock %}
+{% block title %}Contact Us - BrieflyAI{% endblock %}
+{% block content %}
+<div class="animate-fade-in">
+    <div class="page-header-static">
+        <h1>Get In Touch</h1>
+    </div>
+    <div class="static-content-container">
+        <p class="lead text-center mb-5">
+            We'd love to hear from you! Whether you have a question, feedback, or a news tip, feel free to reach out using one of the methods below.
+        </p>
+        <div class="row g-4">
+            <div class="col-md-6">
+                <div class="contact-card">
+                    <div class="icon"><i class="fas fa-envelope"></i></div>
+                    <h4 class="h5">General Inquiries</h4>
+                    <p class="text-muted">For general questions, feedback, or support, please email us at:</p>
+                    <a href="mailto:vbansal639@gmail.com" class="fw-bold">vbansal639@gmail.com</a>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="contact-card">
+                    <div class="icon"><i class="fas fa-handshake"></i></div>
+                    <h4 class="h5">Partnerships & Media</h4>
+                    <p class="text-muted">For partnership opportunities or media inquiries, please contact us at:</p>
+                    <a href="mailto:vbansal639@gmail.com" class="fw-bold">vbansal639@gmail.com</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="text-center mt-5">
+            <h2 class="h3">Follow Us</h2>
+            <p class="text-muted">Stay connected with us on social media.</p>
+            <div class="contact-social-links mt-3">
+                <a href="#" title="Twitter"><i class="fab fa-twitter"></i></a>
+                <a href="#" title="Facebook"><i class="fab fa-facebook-f"></i></a>
+                <a href="#" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                <a href="#" title="Instagram"><i class="fab fa-instagram"></i></a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
 """
 
 PRIVACY_POLICY_HTML_TEMPLATE = """
 {% extends "BASE_HTML_TEMPLATE" %}
-{% block title %}Privacy Policy - {% endblock %}
-{% block content %}<div class="static-content-wrapper animate-fade-in"><h1 class="mb-4">Privacy Policy</h1><p class="text-muted">Last updated: May 31, 2025</p><p>BrieflyAI ("we," "our," or "us") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you visit our website.</p><h2 class="mt-5 mb-3">1. Information We Collect</h2><p>We may collect personal information that you voluntarily provide to us when you register on the website, post articles or comments, bookmark articles, or subscribe to our newsletter. This information may include your name, username, email address, and your activities on our platform such as articles posted and bookmarked.</p><h2 class="mt-5 mb-3">2. How We Use Your Information</h2><p>We use the information we collect to:</p><ul><li>Create and manage your account.</li><li>Operate and maintain the website, including your profile page.</li><li>Display your posted and bookmarked articles as part of your profile.</li><li>Send you newsletters or promotional materials, if you have opted in.</li><li>Respond to your comments and inquiries.</li><li>Improve our website and services.</li></ul><h2 class="mt-5 mb-3">3. Disclosure of Your Information</h2><p>Your username and posted articles are publicly visible. Your bookmarked articles are visible on your profile page to you when logged in. We do not sell, trade, or otherwise transfer your personally identifiable information like your email address to outside parties without your consent, except to trusted third parties who assist us in operating our website, so long as those parties agree to keep this information confidential.</p><h2 class="mt-5 mb-3">4. Security of Your Information</h2><p>We use administrative, technical, and physical security measures to help protect your personal information. While we have taken reasonable steps to secure the personal information you provide to us, please be aware that despite our efforts, no security measures are perfect or impenetrable.</p><h2 class="mt-5 mb-3">5. Your Choices</h2><p>You can review and change your profile information by logging into your account. You may also request deletion of your account and associated data by contacting us.</p><h2 class="mt-5 mb-3">6. Changes to This Privacy Policy</h2><p>We may update this Privacy Policy from time to time. We will notify you of any changes by posting the new Privacy Policy on this page. You are advised to review this Privacy Policy periodically for any changes.</p></div>{% endblock %}
+{% block title %}Privacy Policy - BrieflyAI{% endblock %}
+{% block content %}
+<div class="animate-fade-in">
+    <div class="page-header-static">
+        <h1>Privacy Policy</h1>
+    </div>
+    <div class="static-content-container">
+        <p class="text-muted">Last updated: June 10, 2025</p>
+        <p>BrieflyAI ("we," "our," or "us") is committed to protecting your privacy. This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you visit our website.</p>
+        
+        <h2><i class="icon fas fa-shield-halved"></i>1. Information We Collect</h2>
+        <p>We may collect personal information that you voluntarily provide to us when you register on the website, post articles or comments, bookmark articles, or subscribe to our newsletter. This information may include your name, username, email address, and your activities on our platform such as articles posted and bookmarked.</p>
+        
+        <h2><i class="icon fas fa-tasks"></i>2. How We Use Your Information</h2>
+        <p>We use the information we collect to:</p>
+        <ul>
+            <li>Create and manage your account.</li>
+            <li>Operate and maintain the website, including your profile page.</li>
+            <li>Display your posted and bookmarked articles as part of your profile.</li>
+            <li>Send you newsletters or promotional materials, if you have opted in.</li>
+            <li>Respond to your comments and inquiries.</li>
+            <li>Improve our website and services.</li>
+        </ul>
+
+        <h2><i class="icon fas fa-share-nodes"></i>3. Disclosure of Your Information</h2>
+        <p>Your username and posted articles are publicly visible. Your bookmarked articles are visible on your profile page to you when logged in. We do not sell, trade, or otherwise transfer your personally identifiable information like your email address to outside parties without your consent, except to trusted third parties who assist us in operating our website, so long as those parties agree to keep this information confidential.</p>
+        
+        <h2><i class="icon fas fa-lock"></i>4. Security of Your Information</h2>
+        <p>We use administrative, technical, and physical security measures to help protect your personal information. While we have taken reasonable steps to secure the personal information you provide to us, please be aware that despite our efforts, no security measures are perfect or impenetrable.</p>
+        
+        <h2><i class="icon fas fa-edit"></i>5. Your Choices</h2>
+        <p>You can review and change your profile information by logging into your account. You may also request deletion of your account and associated data by contacting us.</p>
+        
+        <h2><i class="icon fas fa-sync-alt"></i>6. Changes to This Privacy Policy</h2>
+        <p>We may update this Privacy Policy from time to time. We will notify you of any changes by posting the new Privacy Policy on this page. You are advised to review this Privacy Policy periodically for any changes.</p>
+    </div>
+</div>
+{% endblock %}
 """
 
 ERROR_404_TEMPLATE = """{% extends "BASE_HTML_TEMPLATE" %}{% block title %}404 Not Found{% endblock %}{% block content %}<div class='text-center my-5 p-4 article-card animate-fade-in mx-auto' style='max-width: 600px;'><h1><i class='fas fa-exclamation-triangle text-warning me-2'></i>404 - Page Not Found</h1><p class='lead'>Sorry, the page you are looking for does not exist or has been moved.</p><a href='{{url_for("index")}}' class='btn btn-primary-modal mt-2'>Go to Homepage</a></div>{% endblock %}"""
@@ -2129,6 +2992,9 @@ template_storage['CONTACT_HTML_TEMPLATE'] = CONTACT_HTML_TEMPLATE
 template_storage['PRIVACY_POLICY_HTML_TEMPLATE'] = PRIVACY_POLICY_HTML_TEMPLATE
 template_storage['404_TEMPLATE'] = ERROR_404_TEMPLATE
 template_storage['500_TEMPLATE'] = ERROR_500_TEMPLATE
+template_storage['_COMMENT_TEMPLATE'] = _COMMENT_TEMPLATE
+template_storage['PUBLIC_PROFILE_HTML_TEMPLATE'] = PUBLIC_PROFILE_HTML_TEMPLATE
+
 
 # ==============================================================================
 # --- 9. App Context & Main Execution Block ---
